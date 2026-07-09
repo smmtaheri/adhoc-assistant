@@ -1,8 +1,8 @@
-import calendar
 from collections import defaultdict
 from datetime import date
 from typing import Any
 
+from .calendars import display_day, format_date, format_weekday, month_days
 from .config import add_history
 from .constants import SCORE_WEIGHTS, WEEKDAY_NAMES
 
@@ -17,14 +17,10 @@ def empty_person_stats() -> dict[str, Any]:
     }
 
 
-def month_workdays(year: int, month: int) -> list[date]:
+def month_workdays(year: int, month: int, calendar_type: str) -> list[date]:
     """Return all days in the month except Fridays."""
-    _, last_day = calendar.monthrange(year, month)
-
     days = []
-    for day in range(1, last_day + 1):
-        current = date(year, month, day)
-
+    for current in month_days(year, month, calendar_type):
         # Python: Monday=0 ... Friday=4 ... Sunday=6
         if current.weekday() == 4:
             continue
@@ -129,13 +125,14 @@ def choose_person(
 
 
 def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[dict], dict]:
+    calendar_type = config["calendar"]
     year = config["year"]
     month = config["month"]
     people = config["people"]
     history = add_history(db_history or {}, config.get("history", {}))
     holidays = config.get("holidays", {})
 
-    days = month_workdays(year, month)
+    days = month_workdays(year, month, calendar_type)
 
     stats = defaultdict(empty_person_stats)
     for person in people:
@@ -146,8 +143,10 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
 
     for current_day in days:
         weekday = WEEKDAY_NAMES[current_day.weekday()]
-        date_str = current_day.isoformat()
-        holiday_name = holidays.get(date_str, "")
+        gregorian_date = current_day.isoformat()
+        display_date = format_date(current_day, calendar_type)
+        display_weekday = format_weekday(current_day, calendar_type)
+        holiday_name = holidays.get(gregorian_date, "")
 
         main = choose_person(
             people=people,
@@ -161,8 +160,10 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
         if main is None:
             schedule.append(
                 {
-                    "date": date_str,
-                    "weekday": WEEKDAY_NAMES[current_day.weekday()],
+                    "gregorian_date": gregorian_date,
+                    "date": display_date,
+                    "day": display_day(current_day, calendar_type),
+                    "weekday": display_weekday,
                     "holiday": holiday_name,
                     "main": "NO_AVAILABLE_PERSON",
                     "backup": "NO_AVAILABLE_PERSON",
@@ -184,12 +185,14 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
         main_name = main["name"]
 
         schedule.append(
-                {
-                    "date": date_str,
-                    "weekday": WEEKDAY_NAMES[current_day.weekday()],
-                    "holiday": holiday_name,
-                    "main": main_name,
-                    "backup": backup_name,
+            {
+                "gregorian_date": gregorian_date,
+                "date": display_date,
+                "day": display_day(current_day, calendar_type),
+                "weekday": display_weekday,
+                "holiday": holiday_name,
+                "main": main_name,
+                "backup": backup_name,
             }
         )
 

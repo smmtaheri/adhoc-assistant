@@ -1,4 +1,3 @@
-import calendar
 import csv
 import html
 from datetime import date
@@ -7,6 +6,7 @@ from pathlib import Path
 from .constants import (
     HTML_CALENDAR_WEEKDAYS,
     HTML_WEEKDAY_COLUMNS,
+    PERSIAN_WEEKDAY_NAMES,
     WEEKDAY_NAMES,
 )
 
@@ -21,15 +21,31 @@ DAY_PALETTE = [
 ]
 
 
-def print_terminal_calendar(schedule: list[dict], year: int, month: int) -> None:
-    rows = build_calendar_rows(schedule, year, month)
+def calendar_weekday_names(calendar_type: str) -> dict[int, str]:
+    if calendar_type == "jalali":
+        return PERSIAN_WEEKDAY_NAMES
+    return WEEKDAY_NAMES
+
+
+def internal_date(item: dict) -> date:
+    return date.fromisoformat(item.get("gregorian_date", item["date"]))
+
+
+def print_terminal_calendar(
+    schedule: list[dict],
+    year: int,
+    month: int,
+    calendar_type: str,
+) -> None:
+    rows = build_calendar_rows(schedule)
     cell_width = 19
     separator = "-" * ((cell_width + 3) * len(HTML_CALENDAR_WEEKDAYS) - 3)
+    weekday_names = calendar_weekday_names(calendar_type)
 
     print(f"Bug Day Schedule - {year}/{month:02d}")
     print(
         " | ".join(
-            WEEKDAY_NAMES[weekday].center(cell_width)
+            weekday_names[weekday].center(cell_width)
             for weekday in HTML_CALENDAR_WEEKDAYS
         )
     )
@@ -44,8 +60,8 @@ def print_terminal_calendar(schedule: list[dict], year: int, month: int) -> None
                 helper_line.append(" " * cell_width)
                 continue
 
-            day_number = date.fromisoformat(item["date"]).day
-            owner = f"{day_number:02d} {item['main']}"
+            day_number = str(item.get("day", item["date"].split("-")[-1]))
+            owner = f"{day_number.zfill(2)} {item['main']}"
             helper = f"helper: {item['backup']}"
             day_line.append(owner[:cell_width].ljust(cell_width))
             helper_line.append(helper[:cell_width].ljust(cell_width))
@@ -55,9 +71,11 @@ def print_terminal_calendar(schedule: list[dict], year: int, month: int) -> None
         print(separator)
 
 
-def print_summary(stats: dict) -> None:
+def print_summary(stats: dict, calendar_type: str) -> None:
+    thursday_label = "پنجشنبه" if calendar_type == "jalali" else "Thursday"
+
     print("\n\n## Summary")
-    print("| Person | Main | Backup | Total | Thursday |")
+    print(f"| Person | Main | Backup | Total | {thursday_label} |")
     print("|---|---:|---:|---:|---:|")
 
     for name, stat in sorted(stats.items()):
@@ -77,7 +95,16 @@ def write_schedule_csv(schedule: list[dict], output_path: Path) -> None:
             fieldnames=["date", "weekday", "holiday", "main", "backup"],
         )
         writer.writeheader()
-        writer.writerows(schedule)
+        writer.writerows(
+            {
+                "date": item["date"],
+                "weekday": item["weekday"],
+                "holiday": item["holiday"],
+                "main": item["main"],
+                "backup": item["backup"],
+            }
+            for item in schedule
+        )
 
 
 def default_html_output_path(year: int, month: int) -> Path:
@@ -88,28 +115,18 @@ def default_image_output_path(year: int, month: int) -> Path:
     return Path(f"adhoc_schedule_{year}_{month:02d}.svg")
 
 
-def build_calendar_rows(
-    schedule: list[dict],
-    year: int,
-    month: int,
-) -> list[list[dict | None]]:
-    schedule_by_date = {item["date"]: item for item in schedule}
-    _, last_day = calendar.monthrange(year, month)
+def build_calendar_rows(schedule: list[dict]) -> list[list[dict | None]]:
     rows = []
     current_row = [None] * len(HTML_CALENDAR_WEEKDAYS)
 
-    for day_number in range(1, last_day + 1):
-        current_day = date(year, month, day_number)
-
-        if current_day.weekday() == 4:
-            continue
-
+    for item in schedule:
+        current_day = internal_date(item)
         if current_day.weekday() == 5 and any(current_row):
             rows.append(current_row)
             current_row = [None] * len(HTML_CALENDAR_WEEKDAYS)
 
         column = HTML_WEEKDAY_COLUMNS[current_day.weekday()]
-        current_row[column] = schedule_by_date.get(current_day.isoformat())
+        current_row[column] = item
 
     if any(current_row):
         rows.append(current_row)
@@ -121,9 +138,9 @@ def render_calendar_card(item: dict | None) -> str:
     if item is None:
         return '<div class="day-card day-card--empty"></div>'
 
-    current_day = date.fromisoformat(item["date"])
+    current_day = internal_date(item)
     color_index = current_day.day % len(DAY_PALETTE)
-    day_number = html.escape(str(current_day.day))
+    day_number = html.escape(str(item.get("day", current_day.day)))
     main = html.escape(item["main"])
     backup = html.escape(item["backup"])
     holiday = html.escape(item.get("holiday", ""))
@@ -151,11 +168,13 @@ def export_html_calendar(
     schedule: list[dict],
     year: int,
     month: int,
+    calendar_type: str,
     output_path: Path,
 ) -> None:
-    rows = build_calendar_rows(schedule, year, month)
+    rows = build_calendar_rows(schedule)
+    weekday_names = calendar_weekday_names(calendar_type)
     weekday_headers = "\n".join(
-        f"<div class=\"weekday-heading\">{html.escape(WEEKDAY_NAMES[index])}</div>"
+        f"<div class=\"weekday-heading\">{html.escape(weekday_names[index])}</div>"
         for index in HTML_CALENDAR_WEEKDAYS
     )
     week_rows = "\n".join(
@@ -167,9 +186,16 @@ def export_html_calendar(
         for row in rows
     )
     title = html.escape(f"Bug Day Schedule - {year}/{month:02d}")
+    html_lang = "fa" if calendar_type == "jalali" else "en"
+    html_dir = "rtl" if calendar_type == "jalali" else "ltr"
+    subtitle = (
+        "تقویم تیم از شنبه تا پنجشنبه."
+        if calendar_type == "jalali"
+        else "Team calendar from Saturday through Thursday."
+    )
 
     document = f"""<!doctype html>
-<html lang="en" dir="ltr">
+<html lang="{html_lang}" dir="{html_dir}">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -390,7 +416,7 @@ def export_html_calendar(
         <header class="page-header">
             <div>
                 <h1>{title}</h1>
-                <p class="subtitle">Team calendar from Saturday through Thursday.</p>
+                <p class="subtitle">{html.escape(subtitle)}</p>
             </div>
         </header>
         <div class="calendar">
@@ -410,9 +436,9 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
     if item is None:
         return ""
 
-    current_day = date.fromisoformat(item["date"])
+    current_day = internal_date(item)
     bg = DAY_PALETTE[current_day.day % len(DAY_PALETTE)]
-    day_number = html.escape(str(current_day.day))
+    day_number = html.escape(str(item.get("day", current_day.day)))
     main = html.escape(item["main"])
     backup = html.escape(item["backup"])
     holiday = html.escape(item.get("holiday", ""))
@@ -446,9 +472,11 @@ def export_image_calendar(
     schedule: list[dict],
     year: int,
     month: int,
+    calendar_type: str,
     output_path: Path,
 ) -> None:
-    rows = build_calendar_rows(schedule, year, month)
+    rows = build_calendar_rows(schedule)
+    weekday_names = calendar_weekday_names(calendar_type)
     cell_width = 170
     cell_height = 142
     gap = 10
@@ -463,7 +491,7 @@ def export_image_calendar(
         x = left + index * (cell_width + gap) + cell_width / 2
         weekday_labels.append(
             f'<text x="{x}" y="82" text-anchor="middle" class="weekday">'
-            f"{html.escape(WEEKDAY_NAMES[weekday])}</text>"
+            f"{html.escape(weekday_names[weekday])}</text>"
         )
 
     week_lines = []

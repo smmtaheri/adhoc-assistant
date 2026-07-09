@@ -90,8 +90,13 @@ def main() -> None:
 
     schedule, stats = build_schedule(config, db_history=db_history)
 
-    print_terminal_calendar(schedule, config["year"], config["month"])
-    print_summary(stats)
+    print_terminal_calendar(
+        schedule,
+        config["year"],
+        config["month"],
+        config["calendar"],
+    )
+    print_summary(stats, config["calendar"])
 
     csv_path = args.csv or config.get("output", {}).get("csv")
     if csv_path:
@@ -104,6 +109,7 @@ def main() -> None:
         schedule=schedule,
         year=config["year"],
         month=config["month"],
+        calendar_type=config["calendar"],
         output_path=html_path,
     )
     print(f"HTML written to: {html_path}")
@@ -113,6 +119,7 @@ def main() -> None:
         schedule=schedule,
         year=config["year"],
         month=config["month"],
+        calendar_type=config["calendar"],
         output_path=image_path,
     )
     print(f"Image written to: {image_path}")

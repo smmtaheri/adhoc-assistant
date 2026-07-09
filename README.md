@@ -33,6 +33,27 @@ uv run python main.py --html output.html --image output.svg
 The default config file is `adhoc_config.toml`. For each month, fill in `year`,
 `month`, people, unavailable days, and holidays.
 
+Dates default to the Jalali calendar. Configure the date system in the `date`
+section:
+
+```toml
+[date]
+calendar = "jalali" # or "gregorian"
+
+year = 1405
+month = 5
+```
+
+With `calendar = "jalali"`, output dates are Jalali and weekday names are Persian.
+With `calendar = "gregorian"`, output dates are Gregorian and weekday names are
+English.
+
+For Jalali configs, `unavailable_weekdays` can use Persian weekday names:
+
+```toml
+unavailable_weekdays = ["یکشنبه", "پنجشنبه"]
+```
+
 Holidays are not removed from the schedule. They are shown in the output. Only
 Fridays are skipped.
 
@@ -45,7 +66,7 @@ unavailable_days = [3, 10]
 Or as full dates:
 
 ```toml
-unavailable_dates = ["2026-08-03"]
+unavailable_dates = ["1405-05-03"]
 ```
 
 ## SQLite History

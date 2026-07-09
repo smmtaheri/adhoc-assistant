@@ -4,8 +4,12 @@
 #   uv run python main.py
 #   uv run python main.py --save-history
 
-year = 2026
-month = 8
+[date]
+# Supported values: "jalali" (default) or "gregorian".
+calendar = "jalali"
+
+year = 1405
+month = 5
 
 [output]
 csv = "adhoc_schedule.csv"
@@ -20,7 +24,7 @@ unavailable_weekdays = []
 name = "Sara"
 role = "backend"
 unavailable_days = []
-unavailable_weekdays = ["sunday"]
+unavailable_weekdays = ["یکشنبه"]
 
 [[people]]
 name = "Reza"
@@ -32,12 +36,12 @@ unavailable_weekdays = []
 name = "Nima"
 role = "backend"
 unavailable_days = []
-unavailable_weekdays = ["thursday"]
+unavailable_weekdays = ["پنجشنبه"]
 
 # Holidays are still bug days. They are shown in the output, but only Fridays
 # are skipped.
 [[holidays]]
-day = 6
+day = 15
 name = "Sample holiday"
 
 # Optional manual history. Prefer SQLite history for normal monthly usage.

@@ -1,10 +1,14 @@
 import json
 import tomllib
-from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .constants import VALID_WEEKDAYS
+from .calendars import (
+    date_in_month,
+    normalize_calendar_type,
+    parse_calendar_date,
+)
+from .constants import PERSIAN_WEEKDAY_ALIASES, VALID_WEEKDAYS
 
 
 def normalize_count_history(history: dict | None) -> dict[str, dict[str, int]]:
@@ -39,9 +43,26 @@ def add_history(
     return merged
 
 
+def parse_calendar(config: dict) -> str:
+    raw_calendar = config.get("calendar")
+    if isinstance(raw_calendar, dict):
+        raw_calendar = raw_calendar.get("type")
+
+    raw_date_config = config.get("date")
+    if isinstance(raw_date_config, dict):
+        raw_calendar = raw_date_config.get("calendar", raw_calendar)
+
+    return normalize_calendar_type(raw_calendar)
+
+
 def parse_month(config: dict) -> tuple[int, int]:
     raw_year = config.get("year")
     raw_month = config.get("month")
+    raw_date_config = config.get("date")
+
+    if isinstance(raw_date_config, dict):
+        raw_year = raw_date_config.get("year", raw_year)
+        raw_month = raw_date_config.get("month", raw_month)
 
     if isinstance(raw_month, str) and "-" in raw_month:
         year_part, month_part = raw_month.split("-", maxsplit=1)
@@ -53,29 +74,24 @@ def parse_month(config: dict) -> tuple[int, int]:
     return int(raw_year), int(raw_month)
 
 
-def parse_month_date(raw_value: Any, year: int, month: int, field_name: str) -> date:
-    if isinstance(raw_value, int):
-        return date(year, month, raw_value)
-
-    if isinstance(raw_value, str):
-        if raw_value.isdigit():
-            return date(year, month, int(raw_value))
-        return date.fromisoformat(raw_value)
-
-    raise ValueError(f"Invalid {field_name}: {raw_value!r}")
+def normalize_weekday(raw_day: str) -> str:
+    weekday = raw_day.strip().lower()
+    if weekday in VALID_WEEKDAYS:
+        return weekday
+    return PERSIAN_WEEKDAY_ALIASES.get(raw_day.strip(), weekday)
 
 
-def normalize_person(person: dict, year: int, month: int) -> dict:
+def normalize_person(person: dict, year: int, month: int, calendar_type: str) -> dict:
     unavailable_dates = []
 
     for raw_date in person.get("unavailable_dates", []):
         unavailable_dates.append(
-            parse_month_date(raw_date, year, month, "unavailable_dates").isoformat()
+            parse_calendar_date(raw_date, year, month, calendar_type).isoformat()
         )
 
     for raw_day in person.get("unavailable_days", []):
         unavailable_dates.append(
-            parse_month_date(raw_day, year, month, "unavailable_days").isoformat()
+            parse_calendar_date(raw_day, year, month, calendar_type).isoformat()
         )
 
     return {
@@ -83,12 +99,17 @@ def normalize_person(person: dict, year: int, month: int) -> dict:
         "role": person.get("role", ""),
         "unavailable_dates": sorted(set(unavailable_dates)),
         "unavailable_weekdays": [
-            weekday.lower() for weekday in person.get("unavailable_weekdays", [])
+            normalize_weekday(weekday) for weekday in person.get("unavailable_weekdays", [])
         ],
     }
 
 
-def normalize_holidays(raw_holidays: list[Any], year: int, month: int) -> dict[str, str]:
+def normalize_holidays(
+    raw_holidays: list[Any],
+    year: int,
+    month: int,
+    calendar_type: str,
+) -> dict[str, str]:
     holidays = {}
     for item in raw_holidays:
         holiday_name = "Holiday"
@@ -98,21 +119,31 @@ def normalize_holidays(raw_holidays: list[Any], year: int, month: int) -> dict[s
             holiday_name = item.get("name") or holiday_name
             raw_date = item.get("date", item.get("day"))
 
-        holiday_date = parse_month_date(raw_date, year, month, "holidays").isoformat()
+        holiday_date = parse_calendar_date(raw_date, year, month, calendar_type).isoformat()
         holidays[holiday_date] = holiday_name
 
     return holidays
 
 
 def normalize_config(config: dict) -> dict:
+    calendar_type = parse_calendar(config)
     year, month = parse_month(config)
-    people = [normalize_person(person, year, month) for person in config.get("people", [])]
+    people = [
+        normalize_person(person, year, month, calendar_type)
+        for person in config.get("people", [])
+    ]
 
     normalized = {
+        "calendar": calendar_type,
         "year": year,
         "month": month,
         "people": people,
-        "holidays": normalize_holidays(config.get("holidays", []), year, month),
+        "holidays": normalize_holidays(
+            config.get("holidays", []),
+            year,
+            month,
+            calendar_type,
+        ),
         "history": normalize_count_history(config.get("history", {})),
         "output": config.get("output", {}),
     }
@@ -123,6 +154,7 @@ def normalize_config(config: dict) -> dict:
 def validate_config(config: dict) -> None:
     year = config["year"]
     month = config["month"]
+    calendar_type = config["calendar"]
     people = config["people"]
 
     if month < 1 or month > 12:
@@ -147,29 +179,30 @@ def validate_config(config: dict) -> None:
                 allowed = ", ".join(sorted(VALID_WEEKDAYS))
                 raise ValueError(
                     f"Invalid unavailable weekday '{raw_day}' for {name}. "
-                    f"Allowed values: {allowed}"
+                    f"Allowed English values: {allowed}"
                 )
 
         for raw_date in person.get("unavailable_dates", []):
             try:
-                parsed_date = date.fromisoformat(raw_date)
+                parsed_date = parse_calendar_date(raw_date, year, month, "gregorian")
             except ValueError as exc:
                 raise ValueError(
                     f"Invalid unavailable date '{raw_date}' for {name}. "
-                    "Use YYYY-MM-DD or a day number in TOML."
+                    "Use YYYY-MM-DD in the configured calendar, or a day number in TOML."
                 ) from exc
 
-            if parsed_date.year != year or parsed_date.month != month:
+            if not date_in_month(parsed_date, year, month, calendar_type):
                 raise ValueError(
                     f"Unavailable date '{raw_date}' for {name} is outside "
-                    f"{year}-{month:02d}."
+                    f"{year}-{month:02d} in {calendar_type} calendar."
                 )
 
     for raw_date in config.get("holidays", {}):
-        holiday_date = date.fromisoformat(raw_date)
-        if holiday_date.year != year or holiday_date.month != month:
+        holiday_date = parse_calendar_date(raw_date, year, month, "gregorian")
+        if not date_in_month(holiday_date, year, month, calendar_type):
             raise ValueError(
-                f"Holiday date '{raw_date}' is outside {year}-{month:02d}."
+                f"Holiday date '{raw_date}' is outside "
+                f"{year}-{month:02d} in {calendar_type} calendar."
             )
 
 

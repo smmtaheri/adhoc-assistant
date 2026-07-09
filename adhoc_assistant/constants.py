@@ -8,6 +8,31 @@ WEEKDAY_NAMES = {
     6: "Sunday",
 }
 
+PERSIAN_WEEKDAY_NAMES = {
+    0: "دوشنبه",
+    1: "سه‌شنبه",
+    2: "چهارشنبه",
+    3: "پنجشنبه",
+    4: "جمعه",
+    5: "شنبه",
+    6: "یکشنبه",
+}
+
+PERSIAN_WEEKDAY_ALIASES = {
+    "دوشنبه": "monday",
+    "سه‌شنبه": "tuesday",
+    "سه شنبه": "tuesday",
+    "چهارشنبه": "wednesday",
+    "پنجشنبه": "thursday",
+    "پنج‌شنبه": "thursday",
+    "پنج شنبه": "thursday",
+    "جمعه": "friday",
+    "شنبه": "saturday",
+    "یکشنبه": "sunday",
+    "یک‌شنبه": "sunday",
+    "یک شنبه": "sunday",
+}
+
 VALID_WEEKDAYS = {name.lower() for name in WEEKDAY_NAMES.values()}
 
 SCORE_WEIGHTS = {

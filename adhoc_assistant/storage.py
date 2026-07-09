@@ -144,7 +144,7 @@ def save_month_to_db(
                 (
                     year,
                     month,
-                    item["date"],
+                    item.get("gregorian_date", item["date"]),
                     item["weekday"],
                     item["holiday"],
                     item["main"],
