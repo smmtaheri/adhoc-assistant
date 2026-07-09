@@ -1,0 +1,10 @@
+[project]
+name = "adhoc-assistant"
+version = "0.1.0"
+description = "Simple monthly bug day / adhoc scheduler"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

@@ -1,0 +1,49 @@
+# Monthly adhoc / bug-day schedule config.
+#
+# Fill this file every month, then run:
+#   uv run python main.py
+#   uv run python main.py --save-history
+
+year = 2026
+month = 8
+
+[output]
+csv = "adhoc_schedule.csv"
+
+[[people]]
+name = "Ali"
+role = "backend"
+unavailable_days = [3, 10]
+unavailable_weekdays = []
+
+[[people]]
+name = "Sara"
+role = "backend"
+unavailable_days = []
+unavailable_weekdays = ["sunday"]
+
+[[people]]
+name = "Reza"
+role = "frontend"
+unavailable_days = [12]
+unavailable_weekdays = []
+
+[[people]]
+name = "Nima"
+role = "backend"
+unavailable_days = []
+unavailable_weekdays = ["thursday"]
+
+# Holidays are still bug days. They are shown in the output, but only Fridays
+# are skipped.
+[[holidays]]
+day = 6
+name = "Sample holiday"
+
+# Optional manual history. Prefer SQLite history for normal monthly usage.
+#
+# [history.Ali]
+# main_count = 2
+# backup_count = 1
+# total_count = 3
+# thursday_count = 1
