@@ -1,0 +1,20 @@
+services:
+  adhoc-assistant:
+    build: .
+    image: adhoc-assistant:latest
+    volumes:
+      - ./adhoc_config.toml:/app/adhoc_config.toml:ro
+      - ./output:/app/output
+      - adhoc_sqlite_data:/data
+    command:
+      - --db
+      - /data/adhoc_history.sqlite3
+      - --csv
+      - /app/output/adhoc_schedule.csv
+      - --html
+      - /app/output/adhoc_schedule.html
+      - --image
+      - /app/output/adhoc_schedule.svg
+
+volumes:
+  adhoc_sqlite_data:

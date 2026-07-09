@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.sqlite3
+adhoc_schedule*.csv
+adhoc_schedule*.html
+adhoc_schedule*.svg
+adhoc_schedule*.png
+output/
+
+.git/
+.agents/
+.codex/
