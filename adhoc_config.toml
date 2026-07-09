@@ -38,12 +38,6 @@ role = "backend"
 unavailable_days = []
 unavailable_weekdays = ["پنجشنبه"]
 
-# Holidays are still bug days. They are shown in the output, but only Fridays
-# are skipped.
-[[holidays]]
-day = 15
-name = "Sample holiday"
-
 # Optional manual history. Prefer SQLite history for normal monthly usage.
 #
 # [history.Ali]

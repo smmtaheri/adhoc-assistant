@@ -51,7 +51,5 @@ SCORE_WEIGHTS = {
 DEFAULT_CONFIG_PATH = "adhoc_config.toml"
 DEFAULT_DB_PATH = "adhoc_history.sqlite3"
 
-HTML_CALENDAR_WEEKDAYS = [5, 6, 0, 1, 2, 3]
-HTML_WEEKDAY_COLUMNS = {
-    weekday: index for index, weekday in enumerate(HTML_CALENDAR_WEEKDAYS)
-}
+GREGORIAN_CALENDAR_WEEKDAYS = [5, 6, 0, 1, 2, 3]
+JALALI_CALENDAR_WEEKDAYS = [3, 2, 1, 0, 6, 5]

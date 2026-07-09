@@ -4,8 +4,8 @@ from datetime import date
 from pathlib import Path
 
 from .constants import (
-    HTML_CALENDAR_WEEKDAYS,
-    HTML_WEEKDAY_COLUMNS,
+    GREGORIAN_CALENDAR_WEEKDAYS,
+    JALALI_CALENDAR_WEEKDAYS,
     PERSIAN_WEEKDAY_NAMES,
     WEEKDAY_NAMES,
 )
@@ -27,6 +27,12 @@ def calendar_weekday_names(calendar_type: str) -> dict[int, str]:
     return WEEKDAY_NAMES
 
 
+def visual_weekdays(calendar_type: str) -> list[int]:
+    if calendar_type == "jalali":
+        return JALALI_CALENDAR_WEEKDAYS
+    return GREGORIAN_CALENDAR_WEEKDAYS
+
+
 def internal_date(item: dict) -> date:
     return date.fromisoformat(item.get("gregorian_date", item["date"]))
 
@@ -37,16 +43,17 @@ def print_terminal_calendar(
     month: int,
     calendar_type: str,
 ) -> None:
-    rows = build_calendar_rows(schedule)
+    weekdays = visual_weekdays(calendar_type)
+    rows = build_calendar_rows(schedule, calendar_type)
     cell_width = 19
-    separator = "-" * ((cell_width + 3) * len(HTML_CALENDAR_WEEKDAYS) - 3)
+    separator = "-" * ((cell_width + 3) * len(weekdays) - 3)
     weekday_names = calendar_weekday_names(calendar_type)
 
     print(f"Bug Day Schedule - {year}/{month:02d}")
     print(
         " | ".join(
             weekday_names[weekday].center(cell_width)
-            for weekday in HTML_CALENDAR_WEEKDAYS
+            for weekday in weekdays
         )
     )
     print(separator)
@@ -62,7 +69,7 @@ def print_terminal_calendar(
 
             day_number = str(item.get("day", item["date"].split("-")[-1]))
             owner = f"{day_number.zfill(2)} {item['main']}"
-            helper = f"helper: {item['backup']}"
+            helper = f"   {item['backup']}"
             day_line.append(owner[:cell_width].ljust(cell_width))
             helper_line.append(helper[:cell_width].ljust(cell_width))
 
@@ -115,17 +122,22 @@ def default_image_output_path(year: int, month: int) -> Path:
     return Path(f"adhoc_schedule_{year}_{month:02d}.svg")
 
 
-def build_calendar_rows(schedule: list[dict]) -> list[list[dict | None]]:
+def build_calendar_rows(
+    schedule: list[dict],
+    calendar_type: str,
+) -> list[list[dict | None]]:
+    weekdays = visual_weekdays(calendar_type)
+    weekday_columns = {weekday: index for index, weekday in enumerate(weekdays)}
     rows = []
-    current_row = [None] * len(HTML_CALENDAR_WEEKDAYS)
+    current_row = [None] * len(weekdays)
 
     for item in schedule:
         current_day = internal_date(item)
         if current_day.weekday() == 5 and any(current_row):
             rows.append(current_row)
-            current_row = [None] * len(HTML_CALENDAR_WEEKDAYS)
+            current_row = [None] * len(weekdays)
 
-        column = HTML_WEEKDAY_COLUMNS[current_day.weekday()]
+        column = weekday_columns[current_day.weekday()]
         current_row[column] = item
 
     if any(current_row):
@@ -152,12 +164,8 @@ def render_calendar_card(item: dict | None) -> str:
                 <span class="day-number">{day_number}</span>
                 {holiday_badge}
             </div>
-            <div class="bug-day">
-                <span class="bug-day__label">Bug Day</span>
-                <strong>{main}</strong>
-            </div>
+            <strong class="bug-day-name">{main}</strong>
             <div class="helper-pill">
-                <span>Helper</span>
                 <strong>{backup}</strong>
             </div>
         </article>
@@ -171,11 +179,12 @@ def export_html_calendar(
     calendar_type: str,
     output_path: Path,
 ) -> None:
-    rows = build_calendar_rows(schedule)
+    weekdays = visual_weekdays(calendar_type)
+    rows = build_calendar_rows(schedule, calendar_type)
     weekday_names = calendar_weekday_names(calendar_type)
     weekday_headers = "\n".join(
         f"<div class=\"weekday-heading\">{html.escape(weekday_names[index])}</div>"
-        for index in HTML_CALENDAR_WEEKDAYS
+        for index in weekdays
     )
     week_rows = "\n".join(
         f"""
@@ -255,6 +264,7 @@ def export_html_calendar(
         .calendar {{
             display: grid;
             gap: 14px;
+            direction: ltr;
         }}
 
         .weekday-row,
@@ -333,20 +343,11 @@ def export_html_calendar(
             text-overflow: ellipsis;
         }}
 
-        .bug-day {{
+        .bug-day-name {{
             display: grid;
             gap: 2px;
             padding-top: 8px;
             border-top: 1px solid var(--line);
-        }}
-
-        .bug-day__label {{
-            color: var(--muted);
-            font-size: 0.74rem;
-            letter-spacing: 0;
-        }}
-
-        .bug-day strong {{
             font-size: 1.18rem;
             font-weight: 850;
             overflow-wrap: anywhere;
@@ -359,7 +360,6 @@ def export_html_calendar(
             max-width: calc(100% - 20px);
             display: inline-flex;
             align-items: center;
-            gap: 5px;
             color: var(--muted);
             background: rgba(255, 255, 255, 0.66);
             border: 1px solid rgba(120, 120, 120, 0.16);
@@ -458,12 +458,11 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
         {holiday_text}
         <line x1="{x + 12}" y1="{y + 52}" x2="{x + width - 12}" y2="{y + 52}"
               stroke="#deded8"/>
-        <text x="{x + 14}" y="{y + 78}" class="label">Bug Day</text>
-        <text x="{x + 14}" y="{y + 104}" class="owner">{main}</text>
+        <text x="{x + 14}" y="{y + 96}" class="owner">{main}</text>
         <rect x="{x + width - 92}" y="{y + height - 34}" width="78" height="22"
               rx="11" fill="#ffffff" fill-opacity="0.72" stroke="#dddddd"/>
         <text x="{x + width - 53}" y="{y + height - 19}" text-anchor="middle"
-              class="helper">Helper: {backup}</text>
+              class="helper">{backup}</text>
     </g>
     """
 
@@ -475,7 +474,8 @@ def export_image_calendar(
     calendar_type: str,
     output_path: Path,
 ) -> None:
-    rows = build_calendar_rows(schedule)
+    weekdays = visual_weekdays(calendar_type)
+    rows = build_calendar_rows(schedule, calendar_type)
     weekday_names = calendar_weekday_names(calendar_type)
     cell_width = 170
     cell_height = 142
@@ -483,11 +483,11 @@ def export_image_calendar(
     left = 34
     top = 112
     title = html.escape(f"Bug Day Schedule - {year}/{month:02d}")
-    width = left * 2 + len(HTML_CALENDAR_WEEKDAYS) * cell_width + 5 * gap
+    width = left * 2 + len(weekdays) * cell_width + (len(weekdays) - 1) * gap
     height = top + len(rows) * cell_height + max(len(rows) - 1, 0) * gap + 42
 
     weekday_labels = []
-    for index, weekday in enumerate(HTML_CALENDAR_WEEKDAYS):
+    for index, weekday in enumerate(weekdays):
         x = left + index * (cell_width + gap) + cell_width / 2
         weekday_labels.append(
             f'<text x="{x}" y="82" text-anchor="middle" class="weekday">'
@@ -514,7 +514,6 @@ def export_image_calendar(
         .weekday {{ font: 700 13px Inter, Segoe UI, sans-serif; fill: #696b70; }}
         .day-number {{ font: 800 14px Inter, Segoe UI, sans-serif; fill: #19766d; }}
         .holiday {{ font: 700 11px Inter, Segoe UI, sans-serif; fill: #7a4e00; }}
-        .label {{ font: 600 11px Inter, Segoe UI, sans-serif; fill: #696b70; }}
         .owner {{ font: 850 20px Inter, Segoe UI, sans-serif; fill: #202124; }}
         .helper {{ font: 600 10px Inter, Segoe UI, sans-serif; fill: #696b70; }}
     </style>
