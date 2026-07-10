@@ -28,15 +28,25 @@ def availability_summary(response: AvailabilityResponse, calendar_type: str) -> 
     days = "، ".join(str(day) for day in sorted(response.unavailable_days)) or "none"
     recurring = "، ".join(selected_weekdays) or "none"
     status = "confirmed" if response.confirmed else "not confirmed"
+    mode = "fully available" if response.mode == "full" else "custom availability"
     return (
         f"Availability for {response.name}\n"
+        f"Mode: {mode}\n"
         f"Recurring unavailable weekdays: {recurring}\n"
         f"Specific unavailable dates: {days}\n"
         f"Status: {status}"
     )
 
 
-def main_availability_keyboard() -> dict:
+def main_availability_keyboard(response: AvailabilityResponse | None = None) -> dict:
+    if response and response.mode == "full":
+        return markup(
+            [
+                [button("Change availability", "av:custom")],
+                [button("Confirm", "av:confirm")],
+            ]
+        )
+
     return markup(
         [
             [button("I am fully available", "av:full")],
@@ -95,14 +105,40 @@ def dates_keyboard(
     return markup(rows)
 
 
-def admin_approval_keyboard(year: int, month: int, calendar_type: str) -> dict:
+def admin_approval_keyboard(
+    year: int,
+    month: int,
+    calendar_type: str,
+    status: str,
+    has_flagged_members: bool = True,
+) -> dict:
+    key = f"{calendar_type}:{year}:{month}"
+    rows = []
+    if status != "blocked":
+        rows.append([button("Approve", f"admin:approve:{key}")])
+    if has_flagged_members:
+        rows.append([button("Request corrections", f"admin:correct:{key}")])
+    rows.append([button("Reopen for everyone", f"admin:reopen:{key}")])
+    rows.append(
+        [
+            button("Rebuild preview", f"admin:regen:{key}"),
+        ]
+    )
+    rows.append([button("Cancel", f"admin:cancel:{key}")])
+    return markup(rows)
+
+
+def admin_revision_keyboard(year: int, month: int, calendar_type: str) -> dict:
     key = f"{calendar_type}:{year}:{month}"
     return markup(
         [
-            [
-                button("Approve", f"admin:approve:{key}"),
-                button("Regenerate", f"admin:regen:{key}"),
-            ],
+            [button("Close revision now", f"admin:close:{key}")],
+            [button("Reopen for everyone", f"admin:reopen:{key}")],
             [button("Cancel", f"admin:cancel:{key}")],
         ]
     )
+
+
+def admin_canceled_keyboard(year: int, month: int, calendar_type: str) -> dict:
+    key = f"{calendar_type}:{year}:{month}"
+    return markup([[button("Restart survey", f"admin:restart:{key}")]])

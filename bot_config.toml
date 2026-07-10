@@ -27,6 +27,8 @@ survey_start_at = ""
 # responses treated as fully available. Leave empty to wait until everyone
 # responds or the target month starts.
 survey_collect_for = "+2m"
+# How long a correction window stays open when an admin requests revisions.
+revision_collect_for = "+2h"
 # Optional target month override in the configured calendar. Use 0 to keep automatic targeting.
 target_year = 0
 target_month = 0

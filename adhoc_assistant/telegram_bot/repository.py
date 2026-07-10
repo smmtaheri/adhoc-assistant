@@ -14,6 +14,7 @@ class AvailabilityResponse:
     unavailable_days: list[int]
     unavailable_weekdays: list[str]
     confirmed: bool = False
+    mode: str = "custom"
 
 
 def utc_now() -> str:
@@ -62,6 +63,7 @@ class BotRepository:
                     image_path TEXT,
                     schedule_json TEXT,
                     stats_json TEXT,
+                    review_json TEXT,
                     PRIMARY KEY (calendar_type, year, month)
                 )
                 """
@@ -82,6 +84,32 @@ class BotRepository:
                 )
                 """
             )
+            self.ensure_column(
+                conn,
+                "availability_responses",
+                "availability_mode",
+                "TEXT NOT NULL DEFAULT 'custom'",
+            )
+            self.ensure_column(
+                conn,
+                "bot_monthly_runs",
+                "review_json",
+                "TEXT",
+            )
+
+    def ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def get_response(
         self,
@@ -93,7 +121,13 @@ class BotRepository:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT telegram_id, name, unavailable_days, unavailable_weekdays, confirmed
+                SELECT
+                    telegram_id,
+                    name,
+                    unavailable_days,
+                    unavailable_weekdays,
+                    confirmed,
+                    availability_mode
                 FROM availability_responses
                 WHERE calendar_type = ? AND year = ? AND month = ? AND telegram_id = ?
                 """,
@@ -108,6 +142,7 @@ class BotRepository:
             unavailable_days=json.loads(row[2]),
             unavailable_weekdays=json.loads(row[3]),
             confirmed=bool(row[4]),
+            mode=row[5],
         )
 
     def save_response(
@@ -129,15 +164,17 @@ class BotRepository:
                     unavailable_days,
                     unavailable_weekdays,
                     confirmed,
+                    availability_mode,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(calendar_type, year, month, telegram_id)
                 DO UPDATE SET
                     name = excluded.name,
                     unavailable_days = excluded.unavailable_days,
                     unavailable_weekdays = excluded.unavailable_weekdays,
                     confirmed = excluded.confirmed,
+                    availability_mode = excluded.availability_mode,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -149,6 +186,7 @@ class BotRepository:
                     json.dumps(sorted(response.unavailable_days)),
                     json.dumps(sorted(response.unavailable_weekdays)),
                     1 if response.confirmed else 0,
+                    response.mode,
                     utc_now(),
                 ),
             )
@@ -188,7 +226,13 @@ class BotRepository:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT telegram_id, name, unavailable_days, unavailable_weekdays, confirmed
+                SELECT
+                    telegram_id,
+                    name,
+                    unavailable_days,
+                    unavailable_weekdays,
+                    confirmed,
+                    availability_mode
                 FROM availability_responses
                 WHERE calendar_type = ? AND year = ? AND month = ?
                 """,
@@ -202,6 +246,7 @@ class BotRepository:
                 unavailable_days=json.loads(row[2]),
                 unavailable_weekdays=json.loads(row[3]),
                 confirmed=bool(row[4]),
+                mode=row[5],
             )
             for row in rows
         }
@@ -263,9 +308,10 @@ class BotRepository:
                     group_sent_at,
                     image_path,
                     schedule_json,
-                    stats_json
+                    stats_json,
+                    review_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(calendar_type, year, month)
                 DO UPDATE SET
                     status = excluded.status,
@@ -275,7 +321,8 @@ class BotRepository:
                     group_sent_at = excluded.group_sent_at,
                     image_path = excluded.image_path,
                     schedule_json = excluded.schedule_json,
-                    stats_json = excluded.stats_json
+                    stats_json = excluded.stats_json,
+                    review_json = excluded.review_json
                 """,
                 (
                     calendar_type,
@@ -289,6 +336,7 @@ class BotRepository:
                     merged.get("image_path"),
                     merged.get("schedule_json"),
                     merged.get("stats_json"),
+                    merged.get("review_json"),
                 ),
             )
 
@@ -309,7 +357,8 @@ class BotRepository:
                     group_sent_at,
                     image_path,
                     schedule_json,
-                    stats_json
+                    stats_json,
+                    review_json
                 FROM bot_monthly_runs
                 WHERE calendar_type = ? AND year = ? AND month = ?
                 """,
@@ -327,6 +376,7 @@ class BotRepository:
             "image_path": row[5],
             "schedule_json": row[6],
             "stats_json": row[7],
+            "review_json": row[8],
         }
 
     def delete_monthly_run(self, calendar_type: str, year: int, month: int) -> None:

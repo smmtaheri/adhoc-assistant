@@ -75,6 +75,8 @@ services:
       - ${ADHOC_SURVEY_START_AT:-+2m}
       - --survey-collect-for
       - ${ADHOC_SURVEY_COLLECT_FOR:-+2m}
+      - --revision-collect-for
+      - ${ADHOC_REVISION_COLLECT_FOR:-+2h}
       - --target-month
       - ${ADHOC_TARGET_MONTH:-1405-05}
       - --database

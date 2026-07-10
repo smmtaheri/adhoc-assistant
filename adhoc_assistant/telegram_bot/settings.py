@@ -28,6 +28,7 @@ class BotSettings:
     survey_days_before_month: int
     survey_start_at: str
     survey_collect_for: str
+    revision_collect_for: str
     target_year: int | None
     target_month: int | None
     daily_reminder_time: str
@@ -95,6 +96,7 @@ def load_bot_settings(path: Path) -> BotSettings:
         survey_days_before_month=int(schedule.get("survey_days_before_month", 2)),
         survey_start_at=str(schedule.get("survey_start_at", "")).strip(),
         survey_collect_for=str(schedule.get("survey_collect_for", "")).strip(),
+        revision_collect_for=str(schedule.get("revision_collect_for", "+2h")).strip(),
         target_year=int(target_year) if target_year not in (None, "", 0) else None,
         target_month=int(target_month) if target_month not in (None, "", 0) else None,
         daily_reminder_time=str(schedule.get("daily_reminder_time", "09:00")),

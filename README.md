@@ -137,20 +137,29 @@ entering the flow.
 
 The bot asks active members for availability two days before the next month. Users
 can only answer with inline buttons: fully available, recurring unavailable
-weekdays, specific unavailable dates, and confirm. Missing replies are treated as
-fully available when the month starts. The bot sends the generated image to admins
-first; after approval it posts the image to the configured group topic, saves the
+weekdays, specific unavailable dates, and confirm. Choosing fully available locks
+the custom date controls until the user chooses `Change availability`.
+
+When the collection window closes, the bot sends admins a preview with a review
+report. Schedules with missing main/helper coverage are marked `blocked` and
+cannot be approved. Imbalanced but covered schedules stay in admin review, where
+admins can approve, request corrections from flagged members, reopen for
+everyone, rebuild the preview from current data, or cancel the cycle. After a
+revision starts, admins can close it immediately or reopen it for everyone. A
+canceled cycle shows a restart button so the same month can be collected again.
+After approval, the bot posts the image to the configured group topic, saves the
 month into SQLite, and sends the daily 09:00 reminder in that topic.
 
 Authorized users can send `/today` to see today's bug day person and helper with
 their Telegram IDs. This works after a schedule has been approved and saved.
 
-For a timed test, set `ADHOC_SURVEY_START_AT`, `ADHOC_SURVEY_COLLECT_FOR`, and
-`ADHOC_TARGET_MONTH` in `.env`. `ADHOC_SURVEY_START_AT` controls when the bot
-starts messaging members. `ADHOC_SURVEY_COLLECT_FOR` controls how long it waits
-before building the preview with missing replies treated as fully available.
-Both accept values like `+2m`, `+2h`, `+2d`, or an exact timestamp such as
-`2026-07-10 14:30`.
+For a timed test, set `ADHOC_SURVEY_START_AT`, `ADHOC_SURVEY_COLLECT_FOR`,
+`ADHOC_REVISION_COLLECT_FOR`, and `ADHOC_TARGET_MONTH` in `.env`.
+`ADHOC_SURVEY_START_AT` controls when the bot starts messaging members.
+`ADHOC_SURVEY_COLLECT_FOR` controls how long it waits before building the first
+preview. `ADHOC_REVISION_COLLECT_FOR` controls correction windows opened by an
+admin. These values accept forms like `+2m`, `+2h`, `+2d`, or an exact timestamp
+such as `2026-07-10 14:30`.
 
 For an interactive debug run, enable debug mode:
 
@@ -160,11 +169,11 @@ enabled = true
 auto_preview_on_confirm = true
 ```
 
-With debug enabled, `/start` immediately opens the availability form for active
-members. If the sender is an admin, `/start` resets that target month first so
-the test can be repeated from a clean form. Pressing `Confirm` creates the admin
-preview right away, so the whole approve/post flow can be tested without waiting
-for the monthly trigger or for every real member to confirm.
+With debug enabled, only admins can chat with the bot. If the admin is also an
+active member, `/start` immediately opens their availability form and resets that
+target month first so the test can be repeated from a clean form. Pressing
+`Confirm` creates the admin preview right away, so the whole approve/post flow
+can be tested without waiting for the monthly trigger.
 
 In debug mode, members from `debug_members.toml` are added to the real roster.
 Members with `telegram_id = 0` are local/config-only members. They do not receive

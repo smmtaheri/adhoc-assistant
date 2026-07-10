@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -33,6 +34,7 @@ class FakeTelegram:
         self.edit_error = None
         self.answer_error = None
         self.document_error = None
+        self.pin_error = None
         self.events = []
         self.pins = []
         self.reply_markup_edits = []
@@ -127,13 +129,22 @@ class FakeTelegram:
         )
         return {"message_id": message_id}
 
-    def pin_chat_message(self, chat_id, message_id, disable_notification=True):
-        self.events.append(("pin_chat_message", chat_id, message_id))
+    def pin_chat_message(
+        self,
+        chat_id,
+        message_id,
+        disable_notification=True,
+        message_thread_id=None,
+    ):
+        if self.pin_error is not None:
+            raise self.pin_error
+        self.events.append(("pin_chat_message", chat_id, message_id, message_thread_id))
         self.pins.append(
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "disable_notification": disable_notification,
+                "message_thread_id": message_thread_id,
             }
         )
         return {"ok": True}
@@ -170,6 +181,7 @@ def settings(
         survey_days_before_month=2,
         survey_start_at=survey_start_at,
         survey_collect_for="",
+        revision_collect_for="+2h",
         target_year=target_year,
         target_month=target_month,
         daily_reminder_time="09:00",
@@ -375,6 +387,9 @@ class TelegramBotBusinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(tmp_path, debug_enabled=True)
+            bot_settings = bot_settings.__class__(
+                **{**bot_settings.__dict__, "admin_telegram_ids": [1]}
+            )
             repo = BotRepository(bot_settings.database_path)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
@@ -392,11 +407,40 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "collecting")
             self.assertEqual(
                 repo.get_state("active_survey"),
-                {"calendar": "gregorian", "year": 2026, "month": 8, "collect_until": ""},
+                {
+                    "calendar": "gregorian",
+                    "year": 2026,
+                    "month": 8,
+                    "phase": "collecting",
+                    "collect_until": "",
+                    "allowed_member_ids": [],
+                },
             )
             self.assertEqual(len(repo.list_responses("gregorian", 2026, 8)), 1)
             self.assertEqual(fake.messages[-1]["chat_id"], 1)
             self.assertEqual(set(fake.messages[-1]["reply_markup"]), {"inline_keyboard"})
+
+    def test_debug_mode_rejects_non_admin_members_with_inactive_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path, debug_enabled=True)
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            bot.target_month = lambda today=None: (2026, 8)
+
+            bot.handle_update(
+                {
+                    "message": {
+                        "chat": {"id": 1, "type": "private"},
+                        "text": "/start",
+                    }
+                }
+            )
+
+            self.assertEqual(fake.messages[-1]["chat_id"], 1)
+            self.assertEqual(fake.messages[-1]["text"], "The bot is currently inactive.")
+            self.assertIsNone(repo.get_state("active_survey"))
 
     def test_debug_admin_start_resets_month_and_confirm_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -415,7 +459,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 8,
                 AvailabilityResponse(1, "Ali", [5], ["sunday"], True),
             )
-            repo.upsert_monthly_run("gregorian", 2026, 8, "pending_approval")
+            repo.upsert_monthly_run("gregorian", 2026, 8, "pending_admin_review")
 
             bot.handle_update(
                 {
@@ -443,7 +487,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
 
             self.assertEqual(len(fake.photos), 1)
             self.assertEqual(fake.photos[0]["chat_id"], 1)
-            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_approval")
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_admin_review")
 
     def test_start_does_not_create_survey_in_normal_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -484,7 +528,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             )
 
             self.assertEqual(fake.messages[-1]["chat_id"], 404)
-            self.assertEqual(fake.messages[-1]["text"], "You are not allowed to use this bot.")
+            self.assertEqual(fake.messages[-1]["text"], "The bot is currently inactive.")
             self.assertIsNone(repo.get_state("active_survey"))
 
     def test_unknown_callback_user_is_rejected(self) -> None:
@@ -507,6 +551,29 @@ class TelegramBotBusinessTests(unittest.TestCase):
 
             self.assertEqual(fake.answers[-1]["id"], "unknown-1")
             self.assertEqual(fake.answers[-1]["text"], "You are not allowed to use this bot.")
+            self.assertEqual(fake.edits, [])
+
+    def test_debug_mode_rejects_non_admin_callback_with_inactive_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path, debug_enabled=True)
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+
+            bot.handle_availability_callback(
+                {
+                    "id": "debug-member-1",
+                    "from": {"id": 1},
+                    "data": "av:confirm",
+                    "message": {"chat": {"id": 1}, "message_id": 10},
+                }
+            )
+
+            self.assertEqual(fake.answers[-1]["id"], "debug-member-1")
+            self.assertEqual(fake.answers[-1]["text"], "The bot is currently inactive.")
+            self.assertTrue(fake.answers[-1]["show_alert"])
             self.assertEqual(fake.edits, [])
 
     def test_today_command_returns_main_and_backup_with_ids(self) -> None:
@@ -760,7 +827,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             bot.maybe_create_preview(date(2026, 7, 10))
 
             self.assertEqual(len(fake.photos), 1)
-            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_approval")
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_admin_review")
 
     def test_bad_update_does_not_stop_loop_and_offset_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -862,6 +929,70 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertEqual(fake.messages[-1]["chat_id"], 1)
             self.assertIn("Temporary Telegram problem", fake.messages[-1]["text"])
 
+    def test_full_available_locks_custom_choices_until_user_changes_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state(
+                "active_survey",
+                {
+                    "calendar": "gregorian",
+                    "year": 2026,
+                    "month": 8,
+                    "phase": "collecting",
+                    "collect_until": "",
+                    "allowed_member_ids": [],
+                },
+            )
+
+            bot.handle_availability_callback(
+                {
+                    "id": "full-1",
+                    "from": {"id": 1},
+                    "data": "av:full",
+                    "message": {"chat": {"id": 1}, "message_id": 10},
+                }
+            )
+
+            response = repo.get_response("gregorian", 2026, 8, 1)
+            self.assertEqual(response.mode, "full")
+            self.assertTrue(response.confirmed)
+            buttons = [
+                button["callback_data"]
+                for row in fake.edits[-1]["reply_markup"]["inline_keyboard"]
+                for button in row
+            ]
+            self.assertNotIn("av:dates", buttons)
+            self.assertNotIn("av:weekdays", buttons)
+
+            bot.handle_availability_callback(
+                {
+                    "id": "dates-after-full",
+                    "from": {"id": 1},
+                    "data": "av:dates",
+                    "message": {"chat": {"id": 1}, "message_id": 10},
+                }
+            )
+
+            self.assertEqual(fake.answers[-1]["text"], "Use Change availability first.")
+            self.assertEqual(len(fake.edits), 1)
+
+            bot.handle_availability_callback(
+                {
+                    "id": "custom-1",
+                    "from": {"id": 1},
+                    "data": "av:custom",
+                    "message": {"chat": {"id": 1}, "message_id": 10},
+                }
+            )
+
+            response = repo.get_response("gregorian", 2026, 8, 1)
+            self.assertEqual(response.mode, "custom")
+            self.assertFalse(response.confirmed)
+
     def test_preview_approval_and_daily_reminder_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -876,7 +1007,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 "gregorian",
                 2026,
                 8,
-                AvailabilityResponse(1, "Ali", [], ["sunday"], True),
+                AvailabilityResponse(1, "Ali", [], [], True),
             )
 
             bot.maybe_create_preview(date(2026, 8, 1))
@@ -885,7 +1016,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertTrue(fake.photos[0]["photo_path"].exists())
             self.assertEqual(fake.photos[0]["photo_path"].suffix, ".jpg")
             self.assertIn("Preview for August 2026", fake.photos[0]["caption"])
-            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_approval")
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_admin_review")
 
             bot.handle_admin_callback(
                 {
@@ -916,6 +1047,226 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertIn("Good morning", fake.messages[-1]["text"])
             self.assertIn("@", fake.messages[-1]["text"])
             self.assertTrue(repo.daily_was_sent("2026-08-01"))
+
+    def test_approve_reports_pin_failure_to_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            write_schedule_config(bot_settings.schedule_config_path)
+
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            fake.pin_error = TelegramApiError("not enough rights to pin a message")
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(1, "Ali", [], [], True),
+            )
+            bot.maybe_create_preview(date(2026, 8, 1))
+
+            bot.handle_admin_callback(
+                {
+                    "id": "approve-pin-fail",
+                    "from": {"id": 99},
+                    "data": "admin:approve:gregorian:2026:8",
+                    "message": {"chat": {"id": 99}, "message_id": 20},
+                }
+            )
+
+            self.assertEqual(len(fake.photos), 2)
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "approved")
+            admin_message = fake.messages[-1]["text"]
+            self.assertIn("posted", admin_message.lower())
+            self.assertIn("pinning failed", admin_message.lower())
+            self.assertIn("not enough rights to pin a message", admin_message)
+            self.assertNotIn("posted and pinned", admin_message)
+
+    def test_coverage_blocker_cannot_be_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            write_schedule_config(bot_settings.schedule_config_path)
+
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(1, "Ali", [], ["sunday"], True),
+            )
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(2, "Sara", [], [], True),
+            )
+
+            bot.maybe_create_preview(date(2026, 8, 1))
+
+            run = repo.get_monthly_run("gregorian", 2026, 8)
+            self.assertEqual(run["status"], "blocked")
+            self.assertIn("Coverage blockers", fake.photos[0]["caption"])
+
+            bot.handle_admin_callback(
+                {
+                    "id": "approve-blocked",
+                    "from": {"id": 99},
+                    "data": "admin:approve:gregorian:2026:8",
+                    "message": {"chat": {"id": 99}, "message_id": 20},
+                }
+            )
+
+            self.assertEqual(len(fake.photos), 1)
+            self.assertIn("coverage blockers", fake.messages[-1]["text"])
+
+    def test_admin_cancel_closes_cycle_and_removes_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            write_schedule_config(bot_settings.schedule_config_path)
+
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state(
+                "active_survey",
+                {
+                    "calendar": "gregorian",
+                    "year": 2026,
+                    "month": 8,
+                    "phase": "collecting",
+                    "collect_until": "",
+                    "allowed_member_ids": [],
+                },
+            )
+
+            bot.create_preview(2026, 8)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+
+            bot.handle_admin_callback(
+                {
+                    "id": "cancel-1",
+                    "from": {"id": 99},
+                    "data": "admin:cancel:gregorian:2026:8",
+                    "message": {"chat": {"id": 99}, "message_id": 20},
+                }
+            )
+
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "canceled")
+            self.assertIsNone(repo.get_state("active_survey"))
+            self.assertEqual(fake.reply_markup_edits[-1]["reply_markup"], None)
+            self.assertIn("canceled", fake.messages[-1]["text"])
+            self.assertEqual(
+                fake.messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                "admin:restart:gregorian:2026:8",
+            )
+
+            bot.handle_admin_callback(
+                {
+                    "id": "restart-1",
+                    "from": {"id": 99},
+                    "data": "admin:restart:gregorian:2026:8",
+                    "message": {"chat": {"id": 99}, "message_id": 21},
+                }
+            )
+
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "collecting")
+            self.assertEqual(repo.get_state("active_survey")["phase"], "collecting")
+            self.assertEqual([message["chat_id"] for message in fake.messages[-3:]], [1, 2, 99])
+            self.assertIn("restarted", fake.messages[-1]["text"])
+
+    def test_admin_requests_corrections_for_flagged_members_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            write_schedule_config(bot_settings.schedule_config_path)
+
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(1, "Ali", [], ["sunday"], True),
+            )
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(2, "Sara", [], [], True),
+            )
+
+            bot.maybe_create_preview(date(2026, 8, 1))
+            self.assertIn("Request corrections will be sent to: Ali", fake.photos[0]["caption"])
+            fake.messages.clear()
+
+            bot.handle_admin_callback(
+                {
+                    "id": "correct-1",
+                    "from": {"id": 99},
+                    "data": "admin:correct:gregorian:2026:8",
+                    "message": {"chat": {"id": 99}, "message_id": 20},
+                }
+            )
+
+            state = repo.get_state("active_survey")
+            self.assertEqual(state["phase"], "revision_requested")
+            self.assertEqual(state["allowed_member_ids"], [1])
+            self.assertEqual(fake.messages[0]["chat_id"], 1)
+            self.assertIn("needs review", fake.messages[0]["text"])
+            self.assertEqual(fake.messages[1]["chat_id"], 99)
+            self.assertIn("Revision window opened for: Ali", fake.messages[1]["text"])
+            self.assertEqual(
+                fake.messages[1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                "admin:close:gregorian:2026:8",
+            )
+
+            bot.handle_private_text(2, "/start")
+            self.assertIn("closed", fake.messages[-1]["text"])
+
+    def test_debug_survey_messages_only_reachable_admin_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = replace(
+                settings(tmp_path, debug_enabled=True),
+                admin_telegram_ids=[1],
+            )
+            write_schedule_config(bot_settings.schedule_config_path)
+            repo = BotRepository(bot_settings.database_path)
+            fake = FakeTelegram()
+            debug_members = [
+                Member("Ali", 1, "ali_user", "backend", True),
+                Member("Sara", 2, "sara_user", "frontend", True),
+                Member("Local Debug", 0, "", "backend", True),
+            ]
+            bot = AdhocTelegramBot(bot_settings, debug_members, repo, fake)
+
+            bot.send_survey(
+                2026,
+                8,
+                datetime(2026, 7, 29, 9, 0, tzinfo=ZoneInfo("Asia/Tehran")),
+            )
+
+            self.assertEqual([message["chat_id"] for message in fake.messages], [1])
+            self.assertEqual(repo.get_state("active_survey")["phase"], "collecting")
+            repo.save_response(
+                "gregorian",
+                2026,
+                8,
+                AvailabilityResponse(1, "Ali", [], [], True),
+            )
+            self.assertTrue(bot.all_members_responded(2026, 8))
+            bot.create_preview(2026, 8)
+            self.assertIn("Sara", fake.photos[0]["caption"])
+            self.assertNotIn("not confirmed", fake.photos[0]["caption"])
 
     def test_admin_approve_acknowledges_before_posting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -991,7 +1342,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             bot.ensure_month_started_preview(date(2026, 8, 1))
 
             self.assertEqual(len(fake.photos), 1)
-            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_approval")
+            self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_admin_review")
 
 
 if __name__ == "__main__":
