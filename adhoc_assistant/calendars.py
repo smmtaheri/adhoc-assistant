@@ -1,6 +1,11 @@
 from datetime import date
 
-from .constants import PERSIAN_WEEKDAY_NAMES, WEEKDAY_NAMES
+from .constants import (
+    GREGORIAN_MONTH_NAMES,
+    PERSIAN_MONTH_NAMES,
+    PERSIAN_WEEKDAY_NAMES,
+    WEEKDAY_NAMES,
+)
 
 SUPPORTED_CALENDARS = {"jalali", "gregorian"}
 
@@ -210,3 +215,19 @@ def display_day(current_date: date, calendar_type: str) -> int:
     if calendar_type == "gregorian":
         return current_date.day
     return gregorian_to_jalali(current_date)[2]
+
+
+def month_name(month: int, calendar_type: str) -> str:
+    if calendar_type == "gregorian":
+        return GREGORIAN_MONTH_NAMES[month]
+    return PERSIAN_MONTH_NAMES[month]
+
+
+def to_persian_digits(value: int | str) -> str:
+    return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+def format_month_title(year: int, month: int, calendar_type: str) -> str:
+    if calendar_type == "jalali":
+        return f"{month_name(month, calendar_type)}ماه {to_persian_digits(year)}"
+    return f"{month_name(month, calendar_type)} {year}"

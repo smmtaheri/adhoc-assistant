@@ -1,8 +1,11 @@
-# Monthly adhoc / bug-day schedule config.
+# Manual monthly adhoc / bug-day schedule config for the CLI.
 #
 # Fill this file every month, then run:
 #   uv run python main.py
 #   uv run python main.py --save-history
+#
+# Telegram bot mode reads schedule policy from this file, but uses members.toml
+# for the team list and the bot users' button responses for availability.
 
 [date]
 # Supported values: "jalali" (default) or "gregorian".

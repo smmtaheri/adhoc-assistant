@@ -121,6 +121,7 @@ def main() -> None:
         month=config["month"],
         calendar_type=config["calendar"],
         output_path=image_path,
+        stats=stats,
     )
     print(f"Image written to: {image_path}")
 

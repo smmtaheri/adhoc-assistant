@@ -1,8 +1,14 @@
 import csv
 import html
+import shutil
+import subprocess
+import tempfile
 from datetime import date
 from pathlib import Path
 
+from PIL import Image
+
+from .calendars import format_month_title
 from .constants import (
     GREGORIAN_CALENDAR_WEEKDAYS,
     JALALI_CALENDAR_WEEKDAYS,
@@ -49,7 +55,7 @@ def print_terminal_calendar(
     separator = "-" * ((cell_width + 3) * len(weekdays) - 3)
     weekday_names = calendar_weekday_names(calendar_type)
 
-    print(f"Bug Day Schedule - {year}/{month:02d}")
+    print(f"Bug Day Schedule - {format_month_title(year, month, calendar_type)}")
     print(
         " | ".join(
             weekday_names[weekday].center(cell_width)
@@ -96,6 +102,7 @@ def print_summary(stats: dict, calendar_type: str) -> None:
 
 
 def write_schedule_csv(schedule: list[dict], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -119,7 +126,7 @@ def default_html_output_path(year: int, month: int) -> Path:
 
 
 def default_image_output_path(year: int, month: int) -> Path:
-    return Path(f"adhoc_schedule_{year}_{month:02d}.svg")
+    return Path(f"adhoc_schedule_{year}_{month:02d}.jpg")
 
 
 def build_calendar_rows(
@@ -179,6 +186,7 @@ def export_html_calendar(
     calendar_type: str,
     output_path: Path,
 ) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     weekdays = visual_weekdays(calendar_type)
     rows = build_calendar_rows(schedule, calendar_type)
     weekday_names = calendar_weekday_names(calendar_type)
@@ -194,7 +202,7 @@ def export_html_calendar(
         """
         for row in rows
     )
-    title = html.escape(f"Bug Day Schedule - {year}/{month:02d}")
+    title = html.escape(f"Bug Day Schedule - {format_month_title(year, month, calendar_type)}")
     html_lang = "fa" if calendar_type == "jalali" else "en"
     html_dir = "rtl" if calendar_type == "jalali" else "ltr"
     subtitle = (
@@ -432,6 +440,21 @@ def export_html_calendar(
     output_path.write_text(document, encoding="utf-8")
 
 
+def svg_text_lines(
+    value: str,
+    *,
+    max_chars: int,
+    max_lines: int,
+) -> list[str]:
+    lines = wrap_svg_text(value, max_chars)
+    if len(lines) <= max_lines:
+        return lines
+
+    clipped = lines[:max_lines]
+    clipped[-1] = clipped[-1][: max(max_chars - 1, 1)].rstrip() + "…"
+    return clipped
+
+
 def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -> str:
     if item is None:
         return ""
@@ -439,8 +462,13 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
     current_day = internal_date(item)
     bg = DAY_PALETTE[current_day.day % len(DAY_PALETTE)]
     day_number = html.escape(str(item.get("day", current_day.day)))
-    main = html.escape(item["main"])
-    backup = html.escape(item["backup"])
+    main_lines = svg_text_lines(item["main"], max_chars=16, max_lines=2)
+    backup_lines = svg_text_lines(item["backup"], max_chars=20, max_lines=1)
+    main_markup = "".join(
+        f'<tspan x="{x + 18}" dy="{0 if index == 0 else 27}">{html.escape(line)}</tspan>'
+        for index, line in enumerate(main_lines)
+    )
+    backup = html.escape(backup_lines[0])
     holiday = html.escape(item.get("holiday", ""))
     holiday_text = (
         f'<text x="{x + width - 14}" y="{y + 26}" text-anchor="end" '
@@ -458,13 +486,132 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
         {holiday_text}
         <line x1="{x + 12}" y1="{y + 52}" x2="{x + width - 12}" y2="{y + 52}"
               stroke="#deded8"/>
-        <text x="{x + 14}" y="{y + 96}" class="owner">{main}</text>
-        <rect x="{x + width - 92}" y="{y + height - 34}" width="78" height="22"
-              rx="11" fill="#ffffff" fill-opacity="0.72" stroke="#dddddd"/>
-        <text x="{x + width - 53}" y="{y + height - 19}" text-anchor="middle"
+        <text x="{x + 18}" y="{y + 92}" class="owner">{main_markup}</text>
+        <rect x="{x + 14}" y="{y + height - 39}" width="{width - 28}" height="27"
+              rx="13.5" fill="#ffffff" fill-opacity="0.78" stroke="#dddddd"/>
+        <text x="{x + width - 26}" y="{y + height - 20}" text-anchor="end"
               class="helper">{backup}</text>
     </g>
     """
+
+
+def svg_title(year: int, month: int, calendar_type: str) -> str:
+    if calendar_type == "jalali":
+        return f"برنامه ادهاک {format_month_title(year, month, calendar_type)}"
+    return f"Adhoc Schedule - {format_month_title(year, month, calendar_type)}"
+
+
+def summary_values(stats: dict | None) -> list[tuple[str, dict]]:
+    if not stats:
+        return []
+
+    return sorted(
+        (
+            name,
+            {
+                "main_count": int(values.get("main_count", 0)),
+                "backup_count": int(values.get("backup_count", 0)),
+                "total_count": int(values.get("total_count", 0)),
+            },
+        )
+        for name, values in stats.items()
+    )
+
+
+def wrap_svg_text(value: str, max_chars: int) -> list[str]:
+    words = value.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        chunks = [
+            word[index : index + max_chars]
+            for index in range(0, len(word), max_chars)
+        ]
+        for chunk in chunks:
+            candidate = chunk if not current else f"{current} {chunk}"
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = chunk
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_svg_summary(
+    stats: dict | None,
+    calendar_type: str,
+    left: int,
+    start_y: int,
+    width: int,
+) -> tuple[str, int]:
+    rows = summary_values(stats)
+    if not rows:
+        return "", 0
+
+    if calendar_type == "jalali":
+        title = "آمار ماهانه"
+        labels = ("روز باگ", "پشتیبان", "کل")
+        direction = "rtl"
+        anchor = "start"
+        safe_inset = 96
+        title_x = width - left - safe_inset
+        name_x = width - left - 18 - safe_inset
+        value_columns = (left + 150, left + 290, left + 430)
+    else:
+        title = "Monthly summary"
+        labels = ("Bug Day", "Helper", "Total")
+        direction = "ltr"
+        anchor = "start"
+        title_x = left
+        name_x = left + 18
+        value_columns = (width - left - 430, width - left - 290, width - left - 150)
+
+    line_height = 16
+    row_gap = 12
+    wrapped_rows = [(name, wrap_svg_text(name, 24), values) for name, values in rows]
+    row_heights = [max(26, len(name_lines) * line_height) + row_gap for _, name_lines, _ in wrapped_rows]
+    summary_height = 62 + sum(row_heights)
+    main_x, backup_x, total_x = value_columns
+    header_y = start_y + 40
+
+    parts = [
+        f'<text x="{title_x}" y="{start_y + 24}" text-anchor="{anchor}" '
+        f'direction="{direction}" unicode-bidi="plaintext" class="summary-title">{html.escape(title)}</text>',
+        f'<text x="{main_x}" y="{header_y}" text-anchor="middle" class="summary-head">{html.escape(labels[0])}</text>',
+        f'<text x="{backup_x}" y="{header_y}" text-anchor="middle" class="summary-head">{html.escape(labels[1])}</text>',
+        f'<text x="{total_x}" y="{header_y}" text-anchor="middle" class="summary-head">{html.escape(labels[2])}</text>',
+    ]
+
+    current_y = header_y + 26
+    for (name, name_lines, values), row_height in zip(wrapped_rows, row_heights):
+        value_y = current_y + max(0, (row_height - row_gap - 26) // 2)
+        line_parts = [
+            f'<tspan x="{name_x}" dy="{0 if index == 0 else line_height}">'
+            f"{html.escape(line)}</tspan>"
+            for index, line in enumerate(name_lines)
+        ]
+        parts.append(
+            f'<text x="{name_x}" y="{current_y}" text-anchor="{anchor}" direction="{direction}" '
+            f'unicode-bidi="plaintext" class="summary-name">{"".join(line_parts)}</text>'
+        )
+        parts.append(
+            f'<text x="{main_x}" y="{value_y}" text-anchor="middle" class="summary-value">{values["main_count"]}</text>'
+        )
+        parts.append(
+            f'<text x="{backup_x}" y="{value_y}" text-anchor="middle" class="summary-value">{values["backup_count"]}</text>'
+        )
+        parts.append(
+            f'<text x="{total_x}" y="{value_y}" text-anchor="middle" class="summary-value">{values["total_count"]}</text>'
+        )
+        current_y += row_height
+
+    return "\n".join(parts), summary_height
 
 
 def export_image_calendar(
@@ -473,56 +620,113 @@ def export_image_calendar(
     month: int,
     calendar_type: str,
     output_path: Path,
+    stats: dict | None = None,
 ) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    svg = build_calendar_svg(schedule, year, month, calendar_type, stats)
+    if output_path.suffix.lower() in {".jpg", ".jpeg"}:
+        write_svg_as_jpg(svg, output_path)
+        return
+    output_path.write_text(svg, encoding="utf-8")
+
+
+def build_calendar_svg(
+    schedule: list[dict],
+    year: int,
+    month: int,
+    calendar_type: str,
+    stats: dict | None = None,
+) -> str:
     weekdays = visual_weekdays(calendar_type)
     rows = build_calendar_rows(schedule, calendar_type)
     weekday_names = calendar_weekday_names(calendar_type)
-    cell_width = 170
-    cell_height = 142
-    gap = 10
-    left = 34
-    top = 112
-    title = html.escape(f"Bug Day Schedule - {year}/{month:02d}")
-    width = left * 2 + len(weekdays) * cell_width + (len(weekdays) - 1) * gap
-    height = top + len(rows) * cell_height + max(len(rows) - 1, 0) * gap + 42
+    cell_width = 198
+    cell_height = 174
+    gap = 12
+    rtl_canvas_gutter = 480 if calendar_type == "jalali" else 0
+    rtl_content_shift = rtl_canvas_gutter // 2
+    left = 40 + rtl_content_shift
+    top = 150
+    base_width = 40 * 2 + len(weekdays) * cell_width + (len(weekdays) - 1) * gap
+    width = base_width + rtl_canvas_gutter
+    calendar_height = len(rows) * cell_height + max(len(rows) - 1, 0) * gap
+    summary_markup, summary_height = render_svg_summary(
+        stats=stats,
+        calendar_type=calendar_type,
+        left=left,
+        start_y=top + calendar_height + 28,
+        width=width,
+    )
+    height = top + calendar_height + 48 + summary_height
+    title = html.escape(svg_title(year, month, calendar_type))
+    rtl_safe_inset = 96 if calendar_type == "jalali" else 0
+    title_x = width - left - rtl_safe_inset if calendar_type == "jalali" else left
+    title_anchor = "start"
+    title_direction = "rtl" if calendar_type == "jalali" else "ltr"
 
     weekday_labels = []
     for index, weekday in enumerate(weekdays):
         x = left + index * (cell_width + gap) + cell_width / 2
         weekday_labels.append(
-            f'<text x="{x}" y="82" text-anchor="middle" class="weekday">'
+            f'<text x="{x}" y="104" text-anchor="middle" class="weekday">'
             f"{html.escape(weekday_names[weekday])}</text>"
         )
 
-    week_lines = []
     cards = []
     for row_index, row in enumerate(rows):
         y = top + row_index * (cell_height + gap)
-        if row_index > 0:
-            week_lines.append(
-                f'<line x1="{left}" y1="{y - gap / 2}" x2="{width - left}" '
-                f'y2="{y - gap / 2}" stroke="#d0d5d3" stroke-width="1"/>'
-            )
         for column_index, item in enumerate(row):
             x = left + column_index * (cell_width + gap)
             cards.append(render_svg_day(item, x, y, cell_width, cell_height))
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"
-     viewBox="0 0 {width} {height}">
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"
+     viewBox="0 0 {width} {height}" style="background:#ffffff">
     <style>
-        .title {{ font: 800 30px Inter, Segoe UI, sans-serif; fill: #202124; }}
-        .weekday {{ font: 700 13px Inter, Segoe UI, sans-serif; fill: #696b70; }}
-        .day-number {{ font: 800 14px Inter, Segoe UI, sans-serif; fill: #19766d; }}
-        .holiday {{ font: 700 11px Inter, Segoe UI, sans-serif; fill: #7a4e00; }}
-        .owner {{ font: 850 20px Inter, Segoe UI, sans-serif; fill: #202124; }}
-        .helper {{ font: 600 10px Inter, Segoe UI, sans-serif; fill: #696b70; }}
+        .title {{ font: 900 38px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #202124; }}
+        .weekday {{ font: 850 17px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #55585f; }}
+        .day-number {{ font: 900 17px "Noto Sans", sans-serif; fill: #19766d; }}
+        .holiday {{ font: 800 13px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #7a4e00; }}
+        .owner {{ font: 900 25px "Noto Sans", sans-serif; fill: #202124; }}
+        .helper {{ font: 800 13px "Noto Sans", sans-serif; fill: #4f5358; }}
+        .summary-title {{ font: 900 22px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #202124; }}
+        .summary-head {{ font: 850 15px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #55585f; }}
+        .summary-name {{ font: 800 16px "Noto Sans", sans-serif; fill: #202124; }}
+        .summary-value {{ font: 900 16px "Noto Sans", sans-serif; fill: #202124; }}
     </style>
-    <rect width="100%" height="100%" fill="#f7f7f4"/>
-    <text x="{left}" y="46" class="title">{title}</text>
+    <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>
+    <text x="{title_x}" y="66" text-anchor="{title_anchor}" direction="{title_direction}"
+          unicode-bidi="plaintext" class="title">{title}</text>
     {"".join(weekday_labels)}
-    <line x1="{left}" y1="94" x2="{width - left}" y2="94" stroke="#d0d5d3" stroke-width="2"/>
-    {"".join(week_lines)}
+    <line x1="{left}" y1="118" x2="{width - left}" y2="118" stroke="#d0d5d3" stroke-width="2"/>
     {"".join(cards)}
+    {summary_markup}
 </svg>
 """
-    output_path.write_text(svg, encoding="utf-8")
+
+
+def write_svg_as_jpg(svg: str, output_path: Path) -> None:
+    converter = shutil.which("rsvg-convert")
+    if converter is None:
+        raise RuntimeError("rsvg-convert is required to export JPG calendar images.")
+
+    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as svg_file:
+        svg_path = Path(svg_file.name)
+        svg_path.write_text(svg, encoding="utf-8")
+
+    png_path = svg_path.with_suffix(".png")
+    try:
+        subprocess.run(
+            [converter, "-z", "2", "-o", str(png_path), str(svg_path)],
+            check=True,
+            capture_output=True,
+        )
+        with Image.open(png_path) as image:
+            background = Image.new("RGB", image.size, "#ffffff")
+            if image.mode == "RGBA":
+                background.paste(image, mask=image.split()[3])
+            else:
+                background.paste(image)
+            background.save(output_path, format="JPEG", quality=94, optimize=True)
+    finally:
+        svg_path.unlink(missing_ok=True)
+        png_path.unlink(missing_ok=True)
