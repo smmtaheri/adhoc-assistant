@@ -1,0 +1,21 @@
+# Team roster for the Telegram bot.
+# Add/remove people here; set active = false instead of deleting someone from history.
+
+[[members]]
+name = "Moahammad"
+telegram_id = 98354521
+username = "@Admirer135"
+role = "backend"
+active = true
+unavailable_weekdays = []
+unavailable_days = []
+
+
+[[members]]
+name = "Hamed"
+telegram_id = 6476530540
+username = "@hamedanon"
+role = "backend"
+active = true
+unavailable_weekdays = []
+unavailable_days = []

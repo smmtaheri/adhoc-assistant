@@ -1,0 +1,47 @@
+# Runtime settings for the Telegram bot.
+# Put secrets in .env, teammates in members.toml, and manual CLI schedules in adhoc_config.toml.
+
+[bot]
+# Display metadata only. The real Telegram token comes from token_env below.
+name = "adhoc_assistant"
+username = "@adhoc_assistant_bot"
+id = 0
+token_env = "TELEGRAM_BOT_TOKEN"
+timezone = "Asia/Tehran"
+calendar = "jalali"
+
+[telegram]
+# Telegram numeric IDs. The bot must be added to the group/topic before posting there.
+admin_ids = [98354521]
+group_chat_id = -1004459605746
+topic_id = 3
+
+[schedule]
+# Bot automation cadence.
+survey_days_before_month = 2
+# Optional test/override start time. Leave empty for normal monthly automation.
+# Relative examples: "+2m", "+2h", "+2d"
+# Exact examples: "2026-07-10 14:30", "2026-07-10T14:30:00+03:30"
+survey_start_at = ""
+# How long to wait after survey start before generating a preview with missing
+# responses treated as fully available. Leave empty to wait until everyone
+# responds or the target month starts.
+survey_collect_for = "+2m"
+# Optional target month override in the configured calendar. Use 0 to keep automatic targeting.
+target_year = 0
+target_month = 0
+daily_reminder_time = "09:00"
+poll_interval_seconds = 10
+
+[debug]
+# In debug mode, /start creates a survey immediately and Confirm sends an admin preview.
+enabled = false
+auto_preview_on_confirm = true
+
+[paths]
+# Local paths. Docker mounts these same paths inside /app.
+database = "data/adhoc_history.sqlite3"
+schedule_config = "adhoc_config.toml"
+members = "members.toml"
+debug_members = "debug_members.toml"
+output_dir = "output"
