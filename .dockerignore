@@ -4,12 +4,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.env
+bot_config.local.toml
 
 *.sqlite3
+data/
 adhoc_schedule*.csv
 adhoc_schedule*.html
 adhoc_schedule*.svg
 adhoc_schedule*.png
+adhoc_schedule*.jpg
 output/
 
 .git/

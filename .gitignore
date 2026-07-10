@@ -5,10 +5,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.env
+bot_config.local.toml
+data/
 
 *.sqlite3
 adhoc_schedule*.csv
 adhoc_schedule*.html
 adhoc_schedule*.svg
 adhoc_schedule*.png
+adhoc_schedule*.jpg
 output/
