@@ -2,66 +2,87 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from adhoc_assistant.telegram_bot.settings import load_bot_settings
+from adhoc_assistant.constants import DEFAULT_DB_PATH
+from adhoc_assistant.telegram_bot.repository import BotRepository
+from adhoc_assistant.telegram_bot.settings import (
+    RuntimeSettings,
+    load_infra_settings,
+    resolve_database_path,
+)
 
 
 class BotSettingsTests(unittest.TestCase):
-    def test_loads_token_from_env_file_next_to_config(self) -> None:
+    def test_resolve_database_path_prefers_env_over_default(self) -> None:
+        with mock.patch.dict(os.environ, {"DATABASE_URL": "sqlite:///from-url.sqlite3"}, clear=False):
+            self.assertEqual(resolve_database_path(), Path("from-url.sqlite3"))
+
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"DATABASE_URL", "SQLITE_PATH"}
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            os.environ["SQLITE_PATH"] = "from-sqlite-path.sqlite3"
+            self.assertEqual(resolve_database_path(), Path("from-sqlite-path.sqlite3"))
+            del os.environ["SQLITE_PATH"]
+            self.assertEqual(resolve_database_path(), Path(DEFAULT_DB_PATH))
+            self.assertEqual(
+                resolve_database_path(cli_path="from-cli.sqlite3"),
+                Path("from-cli.sqlite3"),
+            )
+
+    def test_load_infra_settings_is_database_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            config_path = tmp_path / "bot_config.toml"
-            config_path.write_text(
-                """
-[bot]
-token_env = "TELEGRAM_BOT_TOKEN_FOR_TEST"
-""".strip(),
-                encoding="utf-8",
-            )
-            (tmp_path / ".env").write_text(
-                "TELEGRAM_BOT_TOKEN_FOR_TEST=token-from-file\n",
-                encoding="utf-8",
-            )
+            db_path = Path(tmp) / "bot.sqlite3"
+            settings = load_infra_settings(cli_database=str(db_path))
+            self.assertEqual(settings.database_path, db_path)
+            self.assertFalse(hasattr(settings, "token_env"))
+            self.assertFalse(hasattr(settings, "seed_runtime"))
+            self.assertFalse(hasattr(settings, "schedule_config_path"))
 
-            old_value = os.environ.pop("TELEGRAM_BOT_TOKEN_FOR_TEST", None)
-            try:
-                settings = load_bot_settings(config_path)
-                self.assertEqual(settings.token, "token-from-file")
-            finally:
-                os.environ.pop("TELEGRAM_BOT_TOKEN_FOR_TEST", None)
-                if old_value is not None:
-                    os.environ["TELEGRAM_BOT_TOKEN_FOR_TEST"] = old_value
-
-    def test_user_paths_are_not_loaded_from_config(self) -> None:
+    def test_incomplete_runtime_settings_raise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            config_path = tmp_path / "bot_config.toml"
-            config_path.write_text(
-                """
-[bot]
-token_env = "TELEGRAM_BOT_TOKEN_FOR_TEST"
+            repo = BotRepository(Path(tmp) / "adhoc.sqlite3")
+            repo.update_runtime_settings(timezone="Asia/Tehran")
+            with self.assertRaises(RuntimeError) as ctx:
+                repo.get_runtime_settings()
+            self.assertIn("Incomplete runtime_settings", str(ctx.exception))
 
-[paths]
-members = "members.toml"
-debug_members = "debug_members.toml"
-""".strip(),
-                encoding="utf-8",
-            )
+    def test_timed_compose_does_not_pass_domain_policy_or_config_files(self) -> None:
+        compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+        self.assertNotIn("bot_config", compose)
+        self.assertNotIn("--config", compose)
+        timed_block = compose.split("adhoc-assistant-timed:")[1].split("adhoc-assistant-cli:")[0]
+        for flag in (
+            "--target-month",
+            "--survey-start-at",
+            "--survey-collect-for",
+            "--revision-collect-for",
+            "TELEGRAM_BOT_TOKEN",
+        ):
+            self.assertNotIn(flag, timed_block)
+        self.assertIn("--database", timed_block)
+        self.assertNotIn("--reset-target-month", timed_block)
 
-            settings = load_bot_settings(config_path)
-            self.assertFalse(hasattr(settings, "members_path"))
-            self.assertFalse(hasattr(settings, "debug_members_path"))
+    def test_postgres_database_url_is_rejected_clearly(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DATABASE_URL": "postgresql://user:pass@localhost:5432/adhoc"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                resolve_database_path()
+            self.assertIn("not supported", str(ctx.exception).lower())
+            self.assertIn("sqlite", str(ctx.exception).lower())
 
-    def test_timed_profile_defaults_live_in_toml(self) -> None:
-        settings = load_bot_settings(Path("bot_config.timed.toml"))
-
-        self.assertEqual(settings.survey_start_at, "+2m")
-        self.assertEqual(settings.survey_collect_for, "+10m")
-        self.assertEqual(settings.revision_collect_for, "+2h")
-        self.assertEqual(settings.target_year, 1405)
-        self.assertEqual(settings.target_month, 5)
-        self.assertEqual(settings.database_path, Path("data/timed_adhoc.sqlite3"))
-        self.assertEqual(settings.output_dir, Path("data/timed_output"))
+    def test_required_runtime_keys_include_token_and_output(self) -> None:
+        missing = RuntimeSettings.missing_keys({})
+        self.assertIn("telegram_token", missing)
+        self.assertIn("output_dir", missing)
+        self.assertIn("bot_name", missing)
+        self.assertIn("holidays", missing)
 
 
 if __name__ == "__main__":

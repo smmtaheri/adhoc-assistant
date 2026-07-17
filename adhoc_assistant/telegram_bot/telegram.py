@@ -21,12 +21,27 @@ class TelegramApiError(RuntimeError):
 
 
 class TelegramClient:
+    # Ambiguous network/5xx retries can duplicate these side effects.
+    NON_IDEMPOTENT_METHODS = frozenset(
+        {
+            "sendMessage",
+            "sendPhoto",
+            "sendDocument",
+            "forwardMessage",
+            "copyMessage",
+            "pinChatMessage",
+        }
+    )
+
     def __init__(self, token: str) -> None:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.request_timeout_seconds = 10
         self.extra_read_timeout_seconds = 5
         self.max_retries = 3
         self.retry_backoff_seconds = 1
+
+    def _allows_ambiguous_retry(self, method: str) -> bool:
+        return method not in self.NON_IDEMPOTENT_METHODS
 
     def request(self, method: str, payload: dict | None = None) -> dict:
         data = urllib.parse.urlencode(payload or {}).encode()
@@ -203,7 +218,11 @@ class TelegramClient:
                 error = self._http_error(method, exc)
                 if error.ignorable:
                     raise error from exc
-                if error.retryable and attempt < self.max_retries:
+                if (
+                    error.retryable
+                    and attempt < self.max_retries
+                    and self._should_retry(method, error)
+                ):
                     self._sleep_for_retry(error, attempt)
                     last_error = error
                     continue
@@ -213,7 +232,10 @@ class TelegramClient:
                     f"Telegram network error for {method}: {exc}",
                     retryable=True,
                 )
-                if attempt < self.max_retries:
+                if (
+                    attempt < self.max_retries
+                    and self._allows_ambiguous_retry(method)
+                ):
                     self._sleep_for_retry(error, attempt)
                     last_error = error
                     continue
@@ -224,7 +246,11 @@ class TelegramClient:
                 return payload
             if error.ignorable:
                 raise error
-            if error.retryable and attempt < self.max_retries:
+            if (
+                error.retryable
+                and attempt < self.max_retries
+                and self._should_retry(method, error)
+            ):
                 self._sleep_for_retry(error, attempt)
                 last_error = error
                 continue
@@ -233,6 +259,13 @@ class TelegramClient:
         if last_error is not None:
             raise last_error
         raise TelegramApiError(f"Telegram request for {method} failed without a response.")
+
+    def _should_retry(self, method: str, error: TelegramApiError) -> bool:
+        """Retry 429 always; skip ambiguous failures for non-idempotent sends."""
+        text = str(error).lower()
+        if "retry_after=" in text or "too many requests" in text or " 429 " in text:
+            return True
+        return self._allows_ambiguous_retry(method)
 
     def _http_error(self, method: str, exc: urllib.error.HTTPError) -> TelegramApiError:
         body = exc.read().decode(errors="replace")

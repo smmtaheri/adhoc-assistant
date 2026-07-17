@@ -145,9 +145,7 @@ def admin_approval_keyboard(
     survey_id: str = "",
 ) -> dict:
     key = survey_id or f"{calendar_type}:{year}:{month}"
-    rows = []
-    if status != "blocked":
-        rows.append([button("Approve", f"admin:approve:{key}")])
+    rows = [[button("Approve", f"admin:approve:{key}")]]
     if has_flagged_members:
         rows.append([button("Request corrections", f"admin:correct:{key}")])
     rows.append([button("Reopen for everyone", f"admin:reopen:{key}")])

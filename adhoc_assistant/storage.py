@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -9,8 +10,21 @@ def month_start(year: int, month: int) -> date:
     return date(year, month, 1)
 
 
+@contextmanager
+def connect(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with connect(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS monthly_stats (
@@ -54,7 +68,7 @@ def load_history_from_db(
     target = month_start(target_year, target_month)
     history = {}
 
-    with sqlite3.connect(db_path) as conn:
+    with connect(db_path) as conn:
         rows = conn.execute(
             """
             SELECT
@@ -94,7 +108,7 @@ def save_month_to_db(
     init_db(db_path)
     plain_stats = stats_to_plain_dict(stats)
 
-    with sqlite3.connect(db_path) as conn:
+    with connect(db_path) as conn:
         conn.execute("DELETE FROM monthly_stats WHERE year = ? AND month = ?", (year, month))
         conn.execute(
             "DELETE FROM schedule_entries WHERE year = ? AND month = ?",

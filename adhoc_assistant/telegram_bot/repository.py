@@ -1,11 +1,52 @@
+import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from adhoc_assistant.scheduler import stats_to_plain_dict
 from adhoc_assistant.storage import init_db as init_schedule_db
-from adhoc_assistant.telegram_bot.settings import Member
+from adhoc_assistant.telegram_bot.settings import Member, RuntimeSettings
+
+
+RUNTIME_SETTINGS_KEY = "runtime_settings"
+ACTIVE_SCHEDULE_SOURCE_KEY = "active_schedule_source"
+SURVEY_KIND_PRODUCTION = "production"
+SURVEY_KIND_DEBUG = "debug"
+SURVEY_KINDS = {SURVEY_KIND_PRODUCTION, SURVEY_KIND_DEBUG}
+TERMINAL_SURVEY_STATUSES = {"approved", "canceled"}
+
+SURVEY_SELECT_COLUMNS = """
+    id,
+    calendar_type,
+    year,
+    month,
+    status,
+    starts_at,
+    closes_at,
+    created_by,
+    requested_at,
+    preview_sent_at,
+    approved_at,
+    group_sent_at,
+    image_path,
+    schedule_json,
+    stats_json,
+    review_json,
+    created_at,
+    updated_at,
+    kind
+"""
+
+
+def active_survey_id_state_key(kind: str) -> str:
+    return f"active_survey_id:{kind}"
+
+
+def active_survey_phase_state_key(kind: str) -> str:
+    return f"active_survey:{kind}"
 
 
 @dataclass
@@ -38,6 +79,7 @@ class Survey:
     review_json: str | None
     created_at: str
     updated_at: str
+    kind: str = SURVEY_KIND_PRODUCTION
 
 
 def normalize_username(username: str) -> str:
@@ -48,14 +90,48 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def stable_participant_id(member: Member) -> int:
+    """Stable survey/response identity. Real Telegram IDs stay positive."""
+    telegram_id = int(member.telegram_id or 0)
+    if telegram_id > 0:
+        return telegram_id
+    if telegram_id < 0:
+        return telegram_id
+    username = normalize_username(member.username)
+    if not username:
+        raise ValueError(
+            f"Participant {member.name!r} needs a telegram_id or username for stable identity."
+        )
+    digest = int(hashlib.md5(username.encode("utf-8")).hexdigest()[:8], 16)
+    return -(1_000_000 + digest % 1_000_000_000)
+
+
+def schedule_person_key(member: Member) -> str:
+    """Stable schedule/history identity. Display name is cosmetic only."""
+    username = normalize_username(member.username)
+    if username:
+        return username
+    return member.name.strip()
+
+
 class BotRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
 
-    def connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def init_db(self) -> None:
         init_schedule_db(self.db_path)
@@ -233,6 +309,12 @@ class BotRepository:
                 "bot_monthly_runs",
                 "survey_id",
                 "TEXT",
+            )
+            self.ensure_column(
+                conn,
+                "surveys",
+                "kind",
+                "TEXT NOT NULL DEFAULT 'production'",
             )
 
     def ensure_column(
@@ -517,6 +599,45 @@ class BotRepository:
         with self.connect() as conn:
             conn.execute("DELETE FROM bot_state WHERE key = ?", (key,))
 
+    def get_runtime_settings(self) -> RuntimeSettings:
+        """Load complete DB-backed policy. Raises if missing or incomplete."""
+        self.migrate_legacy_runtime_settings()
+        raw = self.get_state(RUNTIME_SETTINGS_KEY)
+        if not raw:
+            raise RuntimeError(
+                "runtime_settings is missing from the database. "
+                "Initialize with local CLI --set-* flags "
+                "(for example --set-telegram-token, --set-timezone, "
+                "--set-calendar, --set-output-dir, --set-holidays)."
+            )
+        return RuntimeSettings.from_dict(raw)
+
+    def get_runtime_settings_raw(self) -> dict:
+        self.migrate_legacy_runtime_settings()
+        return dict(self.get_state(RUNTIME_SETTINGS_KEY) or {})
+
+    def set_runtime_settings(self, settings: RuntimeSettings) -> None:
+        self.set_state(RUNTIME_SETTINGS_KEY, settings.as_dict())
+
+    def update_runtime_settings(self, **updates) -> dict:
+        """Merge fields into runtime_settings. May leave the blob incomplete until all required keys are set."""
+        current = self.get_runtime_settings_raw()
+        current.update(updates)
+        self.set_state(RUNTIME_SETTINGS_KEY, current)
+        return current
+
+    def migrate_legacy_runtime_settings(self) -> None:
+        """Merge older single-purpose bot_state keys into runtime_settings once."""
+        current = self.get_state(RUNTIME_SETTINGS_KEY) or {}
+        changed = False
+
+        reminder = self.get_state("daily_reminder_time")
+        if reminder and reminder.get("time") and "daily_reminder_time" not in current:
+            current["daily_reminder_time"] = reminder["time"]
+            changed = True
+
+        if changed:
+            self.set_state(RUNTIME_SETTINGS_KEY, current)
     def set_telegram_destination(
         self,
         *,
@@ -550,6 +671,50 @@ class BotRepository:
             return None
         return int(state["offset"])
 
+    def normalize_survey_kind(self, kind: str) -> str:
+        normalized = kind.strip().lower()
+        if normalized not in SURVEY_KINDS:
+            raise ValueError(f"Unsupported survey kind: {kind}")
+        return normalized
+
+    def set_active_survey_id(self, survey_id: str, kind: str) -> None:
+        kind = self.normalize_survey_kind(kind)
+        self.set_state(active_survey_id_state_key(kind), {"id": survey_id})
+
+    def clear_active_survey_id(self, kind: str) -> None:
+        kind = self.normalize_survey_kind(kind)
+        self.delete_state(active_survey_id_state_key(kind))
+
+    def migrate_legacy_active_survey_state(self) -> None:
+        legacy_id = self.get_state("active_survey_id")
+        if legacy_id and legacy_id.get("id"):
+            production = self.get_state(active_survey_id_state_key(SURVEY_KIND_PRODUCTION))
+            if not production:
+                self.set_state(
+                    active_survey_id_state_key(SURVEY_KIND_PRODUCTION),
+                    {"id": legacy_id["id"]},
+                )
+            self.delete_state("active_survey_id")
+
+        legacy_phase = self.get_state("active_survey")
+        if legacy_phase and legacy_phase.get("id"):
+            production_phase = self.get_state(
+                active_survey_phase_state_key(SURVEY_KIND_PRODUCTION)
+            )
+            if not production_phase:
+                self.set_state(
+                    active_survey_phase_state_key(SURVEY_KIND_PRODUCTION),
+                    legacy_phase,
+                )
+            self.delete_state("active_survey")
+
+    def active_survey_conflict_message(self, active: Survey, kind: str) -> str:
+        return (
+            f"Cannot create a new {kind} survey; survey {active.id} "
+            f"({active.calendar_type} {active.year}-{active.month:02d}) "
+            f"is still {active.status}. Cancel or deactivate it first."
+        )
+
     def create_survey(
         self,
         *,
@@ -562,15 +727,55 @@ class BotRepository:
         closes_at: str,
         created_by: str,
         participants: list[Member],
+        kind: str = SURVEY_KIND_PRODUCTION,
     ) -> Survey:
-        active = self.get_active_survey()
-        if active is not None:
-            raise ValueError(
-                f"Cannot create survey {survey_id}; survey {active.id} is still {active.status}."
+        kind = self.normalize_survey_kind(kind)
+        self.migrate_legacy_active_survey_state()
+        normalized_participants: list[tuple] = []
+        seen_ids: set[int] = set()
+        for member in participants:
+            participant_id = stable_participant_id(member)
+            if participant_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate survey participant identity for {member.name!r} "
+                    f"(id={participant_id}). Unregistered users need distinct usernames."
+                )
+            seen_ids.add(participant_id)
+            normalized_participants.append(
+                (
+                    survey_id,
+                    participant_id,
+                    normalize_username(member.username),
+                    member.name,
+                    member.role,
+                    member.access_level,
+                    1 if member.participates_in_schedule else 0,
+                    1 if member.active else 0,
+                    json.dumps(sorted(member.unavailable_days)),
+                    json.dumps(sorted(member.unavailable_weekdays)),
+                )
             )
 
         now = utc_now()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active_state = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (active_survey_id_state_key(kind),),
+            ).fetchone()
+            if active_state:
+                payload = json.loads(active_state[0])
+                active_id = payload.get("id")
+                if active_id:
+                    row = conn.execute(
+                        "SELECT status FROM surveys WHERE id = ?",
+                        (active_id,),
+                    ).fetchone()
+                    if row and row[0] not in TERMINAL_SURVEY_STATUSES:
+                        raise ValueError(
+                            f"Cannot create a new {kind} survey; survey {active_id} "
+                            f"is still {row[0]}. Cancel or deactivate it first."
+                        )
             conn.execute(
                 """
                 INSERT INTO surveys (
@@ -584,9 +789,10 @@ class BotRepository:
                     created_by,
                     requested_at,
                     created_at,
-                    updated_at
+                    updated_at,
+                    kind
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     survey_id,
@@ -600,6 +806,7 @@ class BotRepository:
                     now,
                     now,
                     now,
+                    kind,
                 ),
             )
             conn.executemany(
@@ -618,37 +825,26 @@ class BotRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [
-                    (
-                        survey_id,
-                        int(member.telegram_id or 0),
-                        normalize_username(member.username),
-                        member.name,
-                        member.role,
-                        member.access_level,
-                        1 if member.participates_in_schedule else 0,
-                        1 if member.active else 0,
-                        json.dumps(sorted(member.unavailable_days)),
-                        json.dumps(sorted(member.unavailable_weekdays)),
-                    )
-                    for member in participants
-                ],
+                normalized_participants,
             )
-        self.set_state("active_survey_id", {"id": survey_id})
-        self.upsert_monthly_run(
-            calendar_type,
-            year,
-            month,
-            status,
-            survey_id=survey_id,
-            requested_at=now,
-        )
+        self.set_active_survey_id(survey_id, kind)
+        if kind == SURVEY_KIND_PRODUCTION:
+            self.upsert_monthly_run(
+                calendar_type,
+                year,
+                month,
+                status,
+                survey_id=survey_id,
+                requested_at=now,
+            )
         survey = self.get_survey(survey_id)
         if survey is None:
             raise RuntimeError(f"Survey {survey_id} was not created.")
+        self.set_active_survey_phase(survey)
         return survey
 
     def survey_row_to_dataclass(self, row: sqlite3.Row | tuple) -> Survey:
+        kind = row[18] if len(row) > 18 and row[18] else SURVEY_KIND_PRODUCTION
         return Survey(
             id=row[0],
             calendar_type=row[1],
@@ -668,31 +864,14 @@ class BotRepository:
             review_json=row[15],
             created_at=row[16] or "",
             updated_at=row[17] or "",
+            kind=kind,
         )
 
     def get_survey(self, survey_id: str) -> Survey | None:
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT
-                    id,
-                    calendar_type,
-                    year,
-                    month,
-                    status,
-                    starts_at,
-                    closes_at,
-                    created_by,
-                    requested_at,
-                    preview_sent_at,
-                    approved_at,
-                    group_sent_at,
-                    image_path,
-                    schedule_json,
-                    stats_json,
-                    review_json,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {SURVEY_SELECT_COLUMNS}
                 FROM surveys
                 WHERE id = ?
                 """,
@@ -700,113 +879,128 @@ class BotRepository:
             ).fetchone()
         return self.survey_row_to_dataclass(row) if row else None
 
-    def get_active_survey(self) -> Survey | None:
-        state = self.get_state("active_survey_id")
+    def get_active_survey(self, kind: str = SURVEY_KIND_PRODUCTION) -> Survey | None:
+        kind = self.normalize_survey_kind(kind)
+        self.migrate_legacy_active_survey_state()
+        state = self.get_state(active_survey_id_state_key(kind))
         if state and state.get("id"):
             survey = self.get_survey(str(state["id"]))
-            if survey is not None and survey.status not in {"approved", "canceled"}:
+            if survey is not None and survey.status not in TERMINAL_SURVEY_STATUSES:
                 return survey
-            self.delete_state("active_survey_id")
+            self.clear_active_survey_id(kind)
 
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT
-                    id,
-                    calendar_type,
-                    year,
-                    month,
-                    status,
-                    starts_at,
-                    closes_at,
-                    created_by,
-                    requested_at,
-                    preview_sent_at,
-                    approved_at,
-                    group_sent_at,
-                    image_path,
-                    schedule_json,
-                    stats_json,
-                    review_json,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {SURVEY_SELECT_COLUMNS}
                 FROM surveys
                 WHERE status NOT IN ('approved', 'canceled')
+                  AND kind = ?
                 ORDER BY created_at DESC
                 LIMIT 1
-                """
+                """,
+                (kind,),
             ).fetchone()
         if row is None:
             return None
         survey = self.survey_row_to_dataclass(row)
-        self.set_state("active_survey_id", {"id": survey.id})
+        self.set_active_survey_id(survey.id, kind)
         return survey
+
+    def list_non_terminal_surveys(self, kind: str | None = None) -> list[Survey]:
+        with self.connect() as conn:
+            if kind is None:
+                rows = conn.execute(
+                    f"""
+                    SELECT {SURVEY_SELECT_COLUMNS}
+                    FROM surveys
+                    WHERE status NOT IN ('approved', 'canceled')
+                    ORDER BY created_at DESC
+                    """
+                ).fetchall()
+            else:
+                kind = self.normalize_survey_kind(kind)
+                rows = conn.execute(
+                    f"""
+                    SELECT {SURVEY_SELECT_COLUMNS}
+                    FROM surveys
+                    WHERE status NOT IN ('approved', 'canceled')
+                      AND kind = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (kind,),
+                ).fetchall()
+        return [self.survey_row_to_dataclass(row) for row in rows]
 
     def get_latest_survey_for_month(
         self,
         calendar_type: str,
         year: int,
         month: int,
+        *,
+        kind: str | None = None,
     ) -> Survey | None:
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    id,
-                    calendar_type,
-                    year,
-                    month,
-                    status,
-                    starts_at,
-                    closes_at,
-                    created_by,
-                    requested_at,
-                    preview_sent_at,
-                    approved_at,
-                    group_sent_at,
-                    image_path,
-                    schedule_json,
-                    stats_json,
-                    review_json,
-                    created_at,
-                    updated_at
-                FROM surveys
-                WHERE calendar_type = ? AND year = ? AND month = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (calendar_type, year, month),
-            ).fetchone()
+            if kind is None:
+                row = conn.execute(
+                    f"""
+                    SELECT {SURVEY_SELECT_COLUMNS}
+                    FROM surveys
+                    WHERE calendar_type = ? AND year = ? AND month = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (calendar_type, year, month),
+                ).fetchone()
+            else:
+                kind = self.normalize_survey_kind(kind)
+                row = conn.execute(
+                    f"""
+                    SELECT {SURVEY_SELECT_COLUMNS}
+                    FROM surveys
+                    WHERE calendar_type = ? AND year = ? AND month = ? AND kind = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (calendar_type, year, month, kind),
+                ).fetchone()
         return self.survey_row_to_dataclass(row) if row else None
 
     def list_surveys(self) -> list[Survey]:
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    calendar_type,
-                    year,
-                    month,
-                    status,
-                    starts_at,
-                    closes_at,
-                    created_by,
-                    requested_at,
-                    preview_sent_at,
-                    approved_at,
-                    group_sent_at,
-                    image_path,
-                    schedule_json,
-                    stats_json,
-                    review_json,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {SURVEY_SELECT_COLUMNS}
                 FROM surveys
                 ORDER BY created_at DESC
                 """
             ).fetchall()
         return [self.survey_row_to_dataclass(row) for row in rows]
+
+    def set_active_survey_phase(self, survey: Survey, **extra) -> None:
+        payload = {
+            "id": survey.id,
+            "kind": survey.kind,
+            "calendar": survey.calendar_type,
+            "year": survey.year,
+            "month": survey.month,
+            "phase": survey.status,
+            "collect_until": survey.closes_at,
+            "allowed_member_ids": [],
+        }
+        payload.update(extra)
+        self.set_state(active_survey_phase_state_key(survey.kind), payload)
+        self.set_active_survey_id(survey.id, survey.kind)
+
+    def get_active_survey_phase(self, kind: str = SURVEY_KIND_PRODUCTION) -> dict | None:
+        kind = self.normalize_survey_kind(kind)
+        self.migrate_legacy_active_survey_state()
+        return self.get_state(active_survey_phase_state_key(kind))
+
+    def clear_active_survey_phase(self, kind: str) -> None:
+        kind = self.normalize_survey_kind(kind)
+        self.delete_state(active_survey_phase_state_key(kind))
+        self.clear_active_survey_id(kind)
 
     def update_survey(
         self,
@@ -850,28 +1044,30 @@ class BotRepository:
                 values,
             )
         updated = self.get_survey(survey_id)
-        if updated and updated.status in {"approved", "canceled"}:
-            state = self.get_state("active_survey_id")
-            if state and state.get("id") == survey_id:
-                self.delete_state("active_survey_id")
-        elif updated:
-            self.set_state("active_survey_id", {"id": survey_id})
         if updated:
-            self.upsert_monthly_run(
-                updated.calendar_type,
-                updated.year,
-                updated.month,
-                updated.status,
-                survey_id=updated.id,
-                requested_at=updated.requested_at,
-                preview_sent_at=updated.preview_sent_at,
-                approved_at=updated.approved_at,
-                group_sent_at=updated.group_sent_at,
-                image_path=updated.image_path,
-                schedule_json=updated.schedule_json,
-                stats_json=updated.stats_json,
-                review_json=updated.review_json,
-            )
+            if updated.status in TERMINAL_SURVEY_STATUSES:
+                state = self.get_state(active_survey_id_state_key(updated.kind))
+                if state and state.get("id") == survey_id:
+                    self.clear_active_survey_id(updated.kind)
+                    self.clear_active_survey_phase(updated.kind)
+            else:
+                self.set_active_survey_id(survey_id, updated.kind)
+            if updated.kind == SURVEY_KIND_PRODUCTION:
+                self.upsert_monthly_run(
+                    updated.calendar_type,
+                    updated.year,
+                    updated.month,
+                    updated.status,
+                    survey_id=updated.id,
+                    requested_at=updated.requested_at,
+                    preview_sent_at=updated.preview_sent_at,
+                    approved_at=updated.approved_at,
+                    group_sent_at=updated.group_sent_at,
+                    image_path=updated.image_path,
+                    schedule_json=updated.schedule_json,
+                    stats_json=updated.stats_json,
+                    review_json=updated.review_json,
+                )
 
     def transition_survey(
         self,
@@ -899,11 +1095,230 @@ class BotRepository:
             changed = cursor.rowcount == 1
         if changed:
             updated = self.get_survey(survey_id)
-            if updated and updated.status in {"approved", "canceled"}:
-                self.delete_state("active_survey_id")
-            elif updated:
-                self.set_state("active_survey_id", {"id": survey_id})
+            if updated:
+                if updated.status in TERMINAL_SURVEY_STATUSES:
+                    state = self.get_state(active_survey_id_state_key(updated.kind))
+                    if state and state.get("id") == survey_id:
+                        self.clear_active_survey_id(updated.kind)
+                        self.clear_active_survey_phase(updated.kind)
+                else:
+                    self.set_active_survey_id(survey_id, updated.kind)
+                if updated.kind == SURVEY_KIND_PRODUCTION:
+                    self.upsert_monthly_run(
+                        updated.calendar_type,
+                        updated.year,
+                        updated.month,
+                        updated.status,
+                        survey_id=updated.id,
+                        requested_at=updated.requested_at,
+                        preview_sent_at=updated.preview_sent_at,
+                        approved_at=updated.approved_at,
+                        group_sent_at=updated.group_sent_at,
+                        image_path=updated.image_path,
+                        schedule_json=updated.schedule_json,
+                        stats_json=updated.stats_json,
+                        review_json=updated.review_json,
+                    )
         return changed
+
+    def set_active_schedule_source(self, year: int, month: int) -> None:
+        self.set_state(ACTIVE_SCHEDULE_SOURCE_KEY, {"year": int(year), "month": int(month)})
+
+    def get_active_schedule_source(self) -> tuple[int, int] | None:
+        state = self.get_state(ACTIVE_SCHEDULE_SOURCE_KEY)
+        if not state:
+            return None
+        year = state.get("year")
+        month = state.get("month")
+        if year is None or month is None:
+            return None
+        return int(year), int(month)
+
+    def claim_daily_reminder(self, work_date: str) -> bool:
+        """Atomically claim today's reminder. Returns True only for the winning claim."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO daily_reminders (work_date, sent_at)
+                VALUES (?, ?)
+                """,
+                (work_date, utc_now()),
+            )
+            return cursor.rowcount == 1
+
+    def mark_daily_sent(self, work_date: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO daily_reminders (work_date, sent_at)
+                VALUES (?, ?)
+                """,
+                (work_date, utc_now()),
+            )
+
+    def daily_was_sent(self, work_date: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM daily_reminders WHERE work_date = ?",
+                (work_date,),
+            ).fetchone()
+        return row is not None
+
+    def clear_daily_reminder(self, work_date: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM daily_reminders WHERE work_date = ?", (work_date,))
+
+    def complete_publish(self, survey_id: str) -> bool:
+        survey = self.get_survey(survey_id)
+        if survey is None or survey.status != "publishing":
+            return False
+
+        if survey.kind == SURVEY_KIND_PRODUCTION:
+            schedule = json.loads(survey.schedule_json or "[]")
+            plain_stats = stats_to_plain_dict(json.loads(survey.stats_json or "{}"))
+        else:
+            schedule = []
+            plain_stats = {}
+
+        now = utc_now()
+        with self.connect() as conn:
+            if survey.kind == SURVEY_KIND_PRODUCTION:
+                conn.execute(
+                    "DELETE FROM monthly_stats WHERE year = ? AND month = ?",
+                    (survey.year, survey.month),
+                )
+                conn.execute(
+                    "DELETE FROM schedule_entries WHERE year = ? AND month = ?",
+                    (survey.year, survey.month),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO monthly_stats (
+                        year,
+                        month,
+                        person,
+                        main_count,
+                        backup_count,
+                        total_count,
+                        thursday_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            survey.year,
+                            survey.month,
+                            person,
+                            counts["main_count"],
+                            counts["backup_count"],
+                            counts["total_count"],
+                            counts["thursday_count"],
+                        )
+                        for person, counts in sorted(plain_stats.items())
+                    ],
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO schedule_entries (
+                        year,
+                        month,
+                        work_date,
+                        weekday,
+                        holiday,
+                        main,
+                        backup
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            survey.year,
+                            survey.month,
+                            item.get("gregorian_date", item["date"]),
+                            item["weekday"],
+                            item["holiday"],
+                            item["main"],
+                            item["backup"],
+                        )
+                        for item in schedule
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO bot_state (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        ACTIVE_SCHEDULE_SOURCE_KEY,
+                        json.dumps({"year": int(survey.year), "month": int(survey.month)}),
+                    ),
+                )
+
+            cursor = conn.execute(
+                """
+                UPDATE surveys
+                SET status = ?, approved_at = ?, group_sent_at = COALESCE(group_sent_at, ?), updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                ("approved", now, now, now, survey.id, "publishing"),
+            )
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
+                "DELETE FROM bot_state WHERE key IN (?, ?)",
+                (
+                    active_survey_id_state_key(survey.kind),
+                    active_survey_phase_state_key(survey.kind),
+                ),
+            )
+
+        updated = self.get_survey(survey.id)
+        if updated and updated.kind == SURVEY_KIND_PRODUCTION:
+            self.upsert_monthly_run(
+                updated.calendar_type,
+                updated.year,
+                updated.month,
+                updated.status,
+                survey_id=updated.id,
+                requested_at=updated.requested_at,
+                preview_sent_at=updated.preview_sent_at,
+                approved_at=updated.approved_at,
+                group_sent_at=updated.group_sent_at,
+                image_path=updated.image_path,
+                schedule_json=updated.schedule_json,
+                stats_json=updated.stats_json,
+                review_json=updated.review_json,
+            )
+        return True
+
+    def get_schedule_entry(self, work_date: str) -> tuple[str, str] | None:
+        source = self.get_active_schedule_source()
+        with self.connect() as conn:
+            if source is not None:
+                year, month = source
+                row = conn.execute(
+                    """
+                    SELECT main, backup
+                    FROM schedule_entries
+                    WHERE work_date = ? AND year = ? AND month = ?
+                    LIMIT 1
+                    """,
+                    (work_date, year, month),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT main, backup
+                    FROM schedule_entries
+                    WHERE work_date = ?
+                    ORDER BY year DESC, month DESC
+                    LIMIT 1
+                    """,
+                    (work_date,),
+                ).fetchone()
+        return (row[0], row[1]) if row else None
 
     def list_survey_participants(self, survey_id: str) -> list[Member]:
         with self.connect() as conn:
@@ -1095,38 +1510,6 @@ class BotRepository:
                 """,
                 (calendar_type, year, month),
             )
-
-    def mark_daily_sent(self, work_date: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO daily_reminders (work_date, sent_at)
-                VALUES (?, ?)
-                """,
-                (work_date, utc_now()),
-            )
-
-    def daily_was_sent(self, work_date: str) -> bool:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM daily_reminders WHERE work_date = ?",
-                (work_date,),
-            ).fetchone()
-        return row is not None
-
-    def get_schedule_entry(self, work_date: str) -> tuple[str, str] | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT main, backup
-                FROM schedule_entries
-                WHERE work_date = ?
-                ORDER BY year DESC, month DESC
-                LIMIT 1
-                """,
-                (work_date,),
-            ).fetchone()
-        return (row[0], row[1]) if row else None
 
     def set_schedule_entry_people(
         self,
@@ -1379,9 +1762,10 @@ class BotRepository:
         }
 
     def user_to_member(self, user: dict) -> Member:
-        return Member(
+        telegram_id = int(user["telegram_id"] or 0)
+        member = Member(
             name=user["display_name"],
-            telegram_id=int(user["telegram_id"] or 0),
+            telegram_id=telegram_id,
             username=user["username"],
             role=user["role"],
             active=bool(user["active"]),
@@ -1394,3 +1778,16 @@ class BotRepository:
             access_level=user["access_level"],
             participates_in_schedule=bool(user.get("participates_in_schedule", True)),
         )
+        if telegram_id <= 0 and normalize_username(member.username):
+            return Member(
+                name=member.name,
+                telegram_id=stable_participant_id(member),
+                username=member.username,
+                role=member.role,
+                active=member.active,
+                unavailable_days=list(member.unavailable_days),
+                unavailable_weekdays=list(member.unavailable_weekdays),
+                access_level=member.access_level,
+                participates_in_schedule=member.participates_in_schedule,
+            )
+        return member

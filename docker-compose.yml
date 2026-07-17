@@ -3,42 +3,17 @@ services:
     build: .
     image: adhoc-assistant:latest
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/adhoc_history.sqlite3}
     volumes:
-      - ./adhoc_config.toml:/app/adhoc_config.toml:ro
-      - ./bot_config.toml:/app/bot_config.toml:ro
       - ./data:/app/data
       - ./output:/app/data/output
     command:
       - python
       - -m
       - adhoc_assistant.telegram_bot
-      - --config
-      - /app/bot_config.toml
       - --database
       - /app/data/adhoc_history.sqlite3
-      - --output-dir
-      - /app/data/output
     restart: unless-stopped
-
-  adhoc-assistant-debug:
-    build: .
-    image: adhoc-assistant:latest
-    profiles:
-      - debug
-    environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-    volumes:
-      - ./adhoc_config.toml:/app/adhoc_config.toml:ro
-      - ./bot_config.debug.toml:/app/bot_config.debug.toml:ro
-      - ./data:/app/data
-      - ./output/debug:/app/data/debug_output
-    command:
-      - python
-      - -m
-      - adhoc_assistant.telegram_bot
-      - --config
-      - /app/bot_config.debug.toml
 
   adhoc-assistant-timed:
     build: .
@@ -46,19 +21,16 @@ services:
     profiles:
       - timed
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      DATABASE_URL: ${TIMED_DATABASE_URL:-sqlite:////app/data/timed_adhoc.sqlite3}
     volumes:
-      - ./adhoc_config.toml:/app/adhoc_config.toml:ro
-      - ./bot_config.timed.toml:/app/bot_config.timed.toml:ro
       - ./data:/app/data
       - ./output/timed:/app/data/timed_output
     command:
       - python
       - -m
       - adhoc_assistant.telegram_bot
-      - --config
-      - /app/bot_config.timed.toml
-      - --reset-target-month
+      - --database
+      - /app/data/timed_adhoc.sqlite3
 
   adhoc-assistant-cli:
     build: .

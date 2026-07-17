@@ -19,9 +19,9 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY adhoc_assistant ./adhoc_assistant
-COPY main.py adhoc_config.toml bot_config.toml ./
+COPY main.py adhoc_config.toml ./
 
 RUN mkdir -p /app/data /app/output && chmod 0777 /app/data /app/output
 
 ENTRYPOINT ["uv", "run"]
-CMD ["python", "-m", "adhoc_assistant.telegram_bot", "--config", "/app/bot_config.toml"]
+CMD ["python", "-m", "adhoc_assistant.telegram_bot", "--database", "/app/data/adhoc_history.sqlite3"]

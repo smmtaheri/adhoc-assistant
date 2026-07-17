@@ -47,6 +47,23 @@ class TelegramClientTests(unittest.TestCase):
         self.assertEqual(urlopen_mock.call_count, 2)
         sleep_mock.assert_called_once_with(1)
 
+    def test_send_message_does_not_retry_ambiguous_network_errors(self) -> None:
+        client = TelegramClient("token")
+        client.max_retries = 3
+
+        with (
+            mock.patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError("timed out"),
+            ) as urlopen_mock,
+            mock.patch("time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(TelegramApiError):
+                client.request("sendMessage", {"chat_id": 1, "text": "hi"})
+
+        self.assertEqual(urlopen_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
     def test_request_retries_after_retry_after_error(self) -> None:
         client = TelegramClient("token")
         error = urllib.error.HTTPError(
