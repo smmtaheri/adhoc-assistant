@@ -116,6 +116,30 @@ class ImageExporterTests(unittest.TestCase):
         self.assertIn("Mohammad With A Very", svg)
         self.assertIn(">12</text>", svg)
 
+    def test_svg_day_cards_fit_long_main_and_helper_names(self) -> None:
+        schedule = [
+            {
+                "gregorian_date": "2026-06-23",
+                "date": "1405-04-02",
+                "day": 2,
+                "weekday": "سه‌شنبه",
+                "holiday": "",
+                "main": "Mohammad Hossein With Long Name",
+                "backup": "Very Long Helper Display Name",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "schedule.svg"
+            export_image_calendar(schedule, 1405, 4, "jalali", output_path)
+            svg = output_path.read_text(encoding="utf-8")
+
+        self.assertIn('class="owner" font-size="', svg)
+        self.assertIn('class="helper" font-size="', svg)
+        self.assertGreaterEqual(svg.count("<tspan"), 3)
+        self.assertIn("Mohammad Hossein", svg)
+        self.assertIn("Very Long Helper", svg)
+
     def test_jpg_export_rasterizes_calendar_with_white_background(self) -> None:
         if shutil.which("rsvg-convert") is None:
             self.skipTest("rsvg-convert is not installed")

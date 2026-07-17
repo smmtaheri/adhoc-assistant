@@ -1,5 +1,6 @@
 # Runtime settings for the Telegram bot.
-# Put secrets in .env, teammates in members.toml, and manual CLI schedules in adhoc_config.toml.
+# Put secrets in .env. Users/admins and Telegram group/topic destination are stored in SQLite.
+# Schedule policy lives in adhoc_config.toml.
 
 [bot]
 # Display metadata only. The real Telegram token comes from token_env below.
@@ -9,12 +10,6 @@ id = 0
 token_env = "TELEGRAM_BOT_TOKEN"
 timezone = "Asia/Tehran"
 calendar = "jalali"
-
-[telegram]
-# Telegram numeric IDs. The bot must be added to the group/topic before posting there.
-admin_ids = [98354521]
-group_chat_id = -1004459605746
-topic_id = 3
 
 [schedule]
 # Bot automation cadence.
@@ -26,7 +21,7 @@ survey_start_at = ""
 # How long to wait after survey start before generating a preview with missing
 # responses treated as fully available. Leave empty to wait until everyone
 # responds or the target month starts.
-survey_collect_for = "+2m"
+survey_collect_for = "+4d"
 # How long a correction window stays open when an admin requests revisions.
 revision_collect_for = "+2h"
 # Optional target month override in the configured calendar. Use 0 to keep automatic targeting.
@@ -44,6 +39,4 @@ auto_preview_on_confirm = true
 # Local paths. Docker mounts these same paths inside /app.
 database = "data/adhoc_history.sqlite3"
 schedule_config = "adhoc_config.toml"
-members = "members.toml"
-debug_members = "debug_members.toml"
 output_dir = "output"

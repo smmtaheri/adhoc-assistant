@@ -1,0 +1,32 @@
+# Runtime settings for the interactive debug Telegram profile.
+# Put secrets in .env. Users/admins and Telegram group/topic destination are stored in SQLite.
+# Schedule policy lives in adhoc_config.toml.
+
+[bot]
+# Display metadata only. The real Telegram token comes from token_env below.
+name = "adhoc_assistant"
+username = "@adhoc_assistant_bot"
+id = 0
+token_env = "TELEGRAM_BOT_TOKEN"
+timezone = "Asia/Tehran"
+calendar = "jalali"
+
+[schedule]
+survey_days_before_month = 2
+survey_start_at = ""
+survey_collect_for = "+4d"
+revision_collect_for = "+2h"
+target_year = 1405
+target_month = 5
+daily_reminder_time = "09:00"
+poll_interval_seconds = 10
+
+[debug]
+enabled = true
+auto_preview_on_confirm = true
+
+[paths]
+# Docker runs this profile from /app and mounts ./data at /app/data.
+database = "data/debug_adhoc.sqlite3"
+schedule_config = "adhoc_config.toml"
+output_dir = "data/debug_output"

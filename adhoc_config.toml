@@ -1,49 +1,31 @@
-# Manual monthly adhoc / bug-day schedule config for the CLI.
+# Manual adhoc / bug-day schedule policy config for the CLI and bot.
 #
-# Fill this file every month, then run:
+# Team members and access levels live in SQLite bot_users, not in this file.
+#
+# Run:
 #   uv run python main.py
 #   uv run python main.py --save-history
 #
-# Telegram bot mode reads schedule policy from this file, but uses members.toml
-# for the team list and the bot users' button responses for availability.
+# Optional custom range instead of year/month:
+# start_date = "1405-05-10"
+# end_date = "1405-06-10"
 
 [date]
 # Supported values: "jalali" (default) or "gregorian".
 calendar = "jalali"
 
-year = 1405
-month = 5
+#year = 1405
+#month = 5
+
+start_date = "1405-04-15"
+end_date = "1405-04-25"
 
 [output]
 csv = "adhoc_schedule.csv"
 
-[[people]]
-name = "Ali"
-role = "backend"
-unavailable_days = [3, 10]
-unavailable_weekdays = []
-
-[[people]]
-name = "Sara"
-role = "backend"
-unavailable_days = []
-unavailable_weekdays = ["یکشنبه"]
-
-[[people]]
-name = "Reza"
-role = "frontend"
-unavailable_days = [12]
-unavailable_weekdays = []
-
-[[people]]
-name = "Nima"
-role = "backend"
-unavailable_days = []
-unavailable_weekdays = ["پنجشنبه"]
-
 # Optional manual history. Prefer SQLite history for normal monthly usage.
 #
-# [history.Ali]
+# [history.PersonName]
 # main_count = 2
 # backup_count = 1
 # total_count = 3

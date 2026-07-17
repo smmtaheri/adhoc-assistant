@@ -14,6 +14,7 @@ from .exporters import (
 )
 from .scheduler import build_schedule
 from .storage import load_history_from_db, save_month_to_db
+from .telegram_bot.repository import BotRepository
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +79,23 @@ def main() -> None:
     config = load_config(Path(args.config))
 
     db_path = Path(args.db)
+    if not config["people"]:
+        members = BotRepository(db_path).list_schedule_members(active_only=True)
+        config["people"] = [
+            {
+                "name": member.name,
+                "role": member.role,
+                "unavailable_dates": [],
+                "unavailable_weekdays": [],
+            }
+            for member in members
+        ]
+        if len(config["people"]) < 2:
+            raise SystemExit(
+                "No team members found in config or SQLite. "
+                "Add users with python -m adhoc_assistant.telegram_bot --upsert-user first."
+            )
+
     people_names = [person["name"] for person in config["people"]]
     db_history = {}
     if not args.no_db_history:

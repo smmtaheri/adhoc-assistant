@@ -7,6 +7,9 @@ __pycache__/
 .coverage
 .env
 bot_config.local.toml
+members.toml
+debug_members.toml
+seed_users.toml
 data/
 
 *.sqlite3

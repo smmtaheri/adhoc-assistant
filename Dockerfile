@@ -19,7 +19,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY adhoc_assistant ./adhoc_assistant
-COPY main.py adhoc_config.toml bot_config.toml members.toml debug_members.toml ./
+COPY main.py adhoc_config.toml bot_config.toml ./
 
 RUN mkdir -p /app/data /app/output && chmod 0777 /app/data /app/output
 

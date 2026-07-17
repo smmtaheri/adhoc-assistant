@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from adhoc_assistant.config import load_config
 from adhoc_assistant.scheduler import build_schedule
 from adhoc_assistant.telegram_bot.keyboards import dates_keyboard, weekdays_keyboard
 from adhoc_assistant.telegram_bot.repository import AvailabilityResponse, BotRepository
@@ -158,6 +159,7 @@ def members() -> list[Member]:
         Member("Ali", 1, "ali_user", "backend", True),
         Member("Sara", 2, "sara_user", "frontend", True),
         Member("Former", 3, "former_user", "backend", False),
+        Member("Admin", 99, "admin_user", "manager", True, access_level="admin", participates_in_schedule=False),
     ]
 
 
@@ -175,9 +177,6 @@ def settings(
         bot_id=0,
         timezone="Asia/Tehran",
         calendar="gregorian",
-        admin_telegram_ids=[99],
-        group_chat_id=-100123,
-        topic_id=456,
         survey_days_before_month=2,
         survey_start_at=survey_start_at,
         survey_collect_for="",
@@ -188,8 +187,6 @@ def settings(
         poll_interval_seconds=1,
         database_path=tmp_path / "adhoc.sqlite3",
         schedule_config_path=tmp_path / "adhoc_config.toml",
-        members_path=tmp_path / "members.toml",
-        debug_members_path=tmp_path / "debug_members.toml",
         output_dir=tmp_path / "output",
         token_env="TELEGRAM_BOT_TOKEN",
         debug_enabled=debug_enabled,
@@ -215,6 +212,20 @@ role = "frontend"
 """.strip(),
         encoding="utf-8",
     )
+
+
+def active_survey_id(bot: AdhocTelegramBot) -> str:
+    survey = bot.active_survey_record()
+    assert survey is not None
+    return survey.id
+
+
+def av(bot: AdhocTelegramBot, action: str) -> str:
+    return f"av:{active_survey_id(bot)}:{action}"
+
+
+def admin(bot: AdhocTelegramBot, action: str) -> str:
+    return f"admin:{action}:{active_survey_id(bot)}"
 
 
 class TelegramBotBusinessTests(unittest.TestCase):
@@ -292,6 +303,36 @@ class TelegramBotBusinessTests(unittest.TestCase):
         self.assertNotEqual(first_day["main"], "Ali")
         self.assertNotEqual(first_day["backup"], "Ali")
 
+    def test_custom_range_config_builds_only_that_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "range.toml"
+            config_path.write_text(
+                """
+[date]
+calendar = "gregorian"
+start_date = "2026-08-03"
+end_date = "2026-08-06"
+
+[[people]]
+name = "Ali"
+role = "backend"
+
+[[people]]
+name = "Sara"
+role = "frontend"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            schedule, _stats = build_schedule(config)
+
+            self.assertEqual(
+                [item["gregorian_date"] for item in schedule],
+                ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"],
+            )
+
     def test_local_members_use_configured_availability_and_do_not_block_collection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -324,6 +365,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
 
             bot_settings = settings(tmp_path)
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, local_members, repo, fake)
             repo.save_response(
@@ -371,6 +413,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             tmp_path = Path(tmp)
             bot_settings = settings(tmp_path)
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
 
@@ -387,12 +430,14 @@ class TelegramBotBusinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(tmp_path, debug_enabled=True)
-            bot_settings = bot_settings.__class__(
-                **{**bot_settings.__dict__, "admin_telegram_ids": [1]}
-            )
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
-            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            debug_members = [
+                Member("Ali", 1, "ali_user", "backend", True, access_level="admin"),
+                Member("Sara", 2, "sara_user", "frontend", True),
+            ]
+            bot = AdhocTelegramBot(bot_settings, debug_members, repo, fake)
             bot.target_month = lambda today=None: (2026, 8)
 
             bot.handle_update(
@@ -405,8 +450,10 @@ class TelegramBotBusinessTests(unittest.TestCase):
             )
 
             self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "collecting")
+            state = repo.get_state("active_survey")
+            self.assertTrue(state["id"].startswith("S-gregorian-2026-08-"))
             self.assertEqual(
-                repo.get_state("active_survey"),
+                {key: state[key] for key in ("calendar", "year", "month", "phase", "collect_until", "allowed_member_ids")},
                 {
                     "calendar": "gregorian",
                     "year": 2026,
@@ -446,13 +493,14 @@ class TelegramBotBusinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(tmp_path, debug_enabled=True, target_year=2026, target_month=8)
-            bot_settings = bot_settings.__class__(
-                **{**bot_settings.__dict__, "admin_telegram_ids": [1]}
-            )
             write_schedule_config(bot_settings.schedule_config_path)
             repo = BotRepository(bot_settings.database_path)
             fake = FakeTelegram()
-            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            debug_members = [
+                Member("Ali", 1, "ali_user", "backend", True, access_level="admin"),
+                Member("Sara", 2, "sara_user", "frontend", True),
+            ]
+            bot = AdhocTelegramBot(bot_settings, debug_members, repo, fake)
             repo.save_response(
                 "gregorian",
                 2026,
@@ -480,7 +528,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "confirm-1",
                     "from": {"id": 1},
-                    "data": "av:confirm",
+                    "data": av(bot, "confirm"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -509,6 +557,53 @@ class TelegramBotBusinessTests(unittest.TestCase):
 
             self.assertIsNone(repo.get_monthly_run("gregorian", 2026, 8))
             self.assertEqual(fake.messages[-1]["text"], "There is no active availability survey right now.")
+
+    def test_start_authorizes_allowed_username_and_stores_telegram_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            repo.upsert_user(
+                username="new_user",
+                display_name="New User",
+                role="backend",
+                access_level="member",
+            )
+            repo.set_state(
+                "active_survey",
+                {
+                    "calendar": "gregorian",
+                    "year": 2026,
+                    "month": 8,
+                    "phase": "collecting",
+                    "collect_until": "",
+                    "allowed_member_ids": [],
+                },
+            )
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, [], repo, fake)
+
+            bot.handle_update(
+                {
+                    "message": {
+                        "from": {
+                            "id": 777,
+                            "username": "new_user",
+                            "first_name": "Telegram",
+                            "last_name": "Name",
+                        },
+                        "chat": {"id": 777, "type": "private"},
+                        "text": "/start",
+                    }
+                }
+            )
+
+            user = repo.get_user_by_username("new_user")
+            self.assertEqual(user["telegram_id"], 777)
+            self.assertEqual(user["display_name"], "Telegram")
+            self.assertEqual(bot.members[0].name, "Telegram")
+            self.assertEqual(fake.messages[-1]["chat_id"], 777)
+            self.assertEqual(set(fake.messages[-1]["reply_markup"]), {"inline_keyboard"})
 
     def test_unknown_private_user_is_rejected_before_any_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,7 +639,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "unknown-1",
                     "from": {"id": 404},
-                    "data": "av:confirm",
+                    "data": av(bot, "confirm"),
                     "message": {"chat": {"id": 404}, "message_id": 10},
                 }
             )
@@ -566,7 +661,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "debug-member-1",
                     "from": {"id": 1},
-                    "data": "av:confirm",
+                    "data": av(bot, "confirm"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -707,12 +802,15 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "collecting")
             self.assertTrue(bot.collection_deadline_reached(preview_time))
 
-            preview_calls: list[tuple[int, int]] = []
-            bot.create_preview = lambda year, month: preview_calls.append((year, month))
+            preview_calls: list[tuple[int, int, str | None]] = []
+            bot.create_preview = (
+                lambda year, month, survey_id=None: preview_calls.append((year, month, survey_id))
+            )
             bot.maybe_create_preview(preview_time)
-            self.assertEqual(preview_calls, [(2026, 8)])
+            self.assertEqual(preview_calls[0][:2], (2026, 8))
+            self.assertTrue(preview_calls[0][2].startswith("S-gregorian-2026-08-"))
 
-    def test_relative_survey_repeats_every_interval(self) -> None:
+    def test_relative_survey_is_one_shot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(
@@ -738,15 +836,16 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertEqual(len(fake.messages), 2)
 
             bot.ensure_survey_started(start + timedelta(minutes=4))
-            self.assertEqual(len(fake.messages), 4)
+            self.assertEqual(len(fake.messages), 2)
 
             bot.ensure_survey_started(start + timedelta(minutes=6))
-            self.assertEqual(len(fake.messages), 6)
+            self.assertEqual(len(fake.messages), 2)
             self.assertEqual(
                 repo.get_monthly_run("gregorian", 2026, 8)["status"], "collecting"
             )
+            self.assertTrue(repo.get_state("scheduled_survey_start")["consumed"])
 
-    def test_relative_survey_catches_up_without_bursting(self) -> None:
+    def test_relative_survey_late_tick_sends_once_without_bursting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(
@@ -766,8 +865,8 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertEqual(len(fake.messages), 2)
 
             state = repo.get_state("scheduled_survey_start")
-            next_start = datetime.fromisoformat(state["start_at"])
-            self.assertGreater(next_start, start + timedelta(minutes=20))
+            self.assertTrue(state["consumed"])
+            self.assertEqual(state["start_at"], (start + timedelta(minutes=2)).isoformat())
 
     def test_empty_survey_start_uses_monthly_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -878,7 +977,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "confirm-1",
                     "from": {"id": 1},
-                    "data": "av:confirm",
+                    "data": av(bot, "confirm"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -898,7 +997,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "dates-1",
                     "from": {"id": 1},
-                    "data": "av:dates",
+                    "data": av(bot, "dates"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -920,7 +1019,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "dates-2",
                     "from": {"id": 1},
-                    "data": "av:dates",
+                    "data": av(bot, "dates"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -952,7 +1051,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "full-1",
                     "from": {"id": 1},
-                    "data": "av:full",
+                    "data": av(bot, "full"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -972,7 +1071,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "dates-after-full",
                     "from": {"id": 1},
-                    "data": "av:dates",
+                    "data": av(bot, "dates"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -984,7 +1083,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
                 {
                     "id": "custom-1",
                     "from": {"id": 1},
-                    "data": "av:custom",
+                    "data": av(bot, "custom"),
                     "message": {"chat": {"id": 1}, "message_id": 10},
                 }
             )
@@ -1000,6 +1099,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
             repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
@@ -1016,6 +1116,8 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertTrue(fake.photos[0]["photo_path"].exists())
             self.assertEqual(fake.photos[0]["photo_path"].suffix, ".jpg")
             self.assertIn("Preview for August 2026", fake.photos[0]["caption"])
+            self.assertLessEqual(len(fake.photos[0]["caption"]), 1024)
+            self.assertIn("Preview report for August 2026", fake.messages[-1]["text"])
             self.assertEqual(repo.get_monthly_run("gregorian", 2026, 8)["status"], "pending_admin_review")
 
             bot.handle_admin_callback(
@@ -1048,6 +1150,35 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertIn("@", fake.messages[-1]["text"])
             self.assertTrue(repo.daily_was_sent("2026-08-01"))
 
+    def test_preview_is_sent_to_db_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            write_schedule_config(bot_settings.schedule_config_path)
+
+            repo = BotRepository(bot_settings.database_path)
+            repo.upsert_user(
+                username="admin_user",
+                display_name="Admin User",
+                role="backend",
+                access_level="admin",
+                telegram_id=909,
+            )
+            repo.upsert_user(
+                username="member_user",
+                display_name="Member User",
+                role="frontend",
+                access_level="member",
+                telegram_id=808,
+            )
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, [], repo, fake)
+            repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
+
+            bot.create_preview(2026, 8)
+
+            self.assertEqual(fake.photos[0]["chat_id"], 909)
+
     def test_approve_reports_pin_failure_to_admin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1055,6 +1186,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             fake.pin_error = TelegramApiError("not enough rights to pin a message")
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
@@ -1091,6 +1223,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
             repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
@@ -1111,7 +1244,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
 
             run = repo.get_monthly_run("gregorian", 2026, 8)
             self.assertEqual(run["status"], "blocked")
-            self.assertIn("Coverage blockers", fake.photos[0]["caption"])
+            self.assertIn("Coverage blockers", fake.messages[-1]["text"])
 
             bot.handle_admin_callback(
                 {
@@ -1132,6 +1265,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
             repo.set_state(
@@ -1162,9 +1296,10 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertIsNone(repo.get_state("active_survey"))
             self.assertEqual(fake.reply_markup_edits[-1]["reply_markup"], None)
             self.assertIn("canceled", fake.messages[-1]["text"])
-            self.assertEqual(
-                fake.messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
-                "admin:restart:gregorian:2026:8",
+            self.assertTrue(
+                fake.messages[-1]["reply_markup"]["inline_keyboard"][0][0][
+                    "callback_data"
+                ].startswith("admin:restart:S-")
             )
 
             bot.handle_admin_callback(
@@ -1188,6 +1323,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
             repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})
@@ -1205,7 +1341,8 @@ class TelegramBotBusinessTests(unittest.TestCase):
             )
 
             bot.maybe_create_preview(date(2026, 8, 1))
-            self.assertIn("Request corrections will be sent to: Ali", fake.photos[0]["caption"])
+            self.assertLessEqual(len(fake.photos[0]["caption"]), 1024)
+            self.assertIn("Request corrections will be sent to: Ali", fake.messages[-1]["text"])
             fake.messages.clear()
 
             bot.handle_admin_callback(
@@ -1226,7 +1363,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             self.assertIn("Revision window opened for: Ali", fake.messages[1]["text"])
             self.assertEqual(
                 fake.messages[1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
-                "admin:close:gregorian:2026:8",
+                admin(bot, "close"),
             )
 
             bot.handle_private_text(2, "/start")
@@ -1235,15 +1372,12 @@ class TelegramBotBusinessTests(unittest.TestCase):
     def test_debug_survey_messages_only_reachable_admin_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            bot_settings = replace(
-                settings(tmp_path, debug_enabled=True),
-                admin_telegram_ids=[1],
-            )
+            bot_settings = settings(tmp_path, debug_enabled=True)
             write_schedule_config(bot_settings.schedule_config_path)
             repo = BotRepository(bot_settings.database_path)
             fake = FakeTelegram()
             debug_members = [
-                Member("Ali", 1, "ali_user", "backend", True),
+                Member("Ali", 1, "ali_user", "backend", True, access_level="admin"),
                 Member("Sara", 2, "sara_user", "frontend", True),
                 Member("Local Debug", 0, "", "backend", True),
             ]
@@ -1265,8 +1399,8 @@ class TelegramBotBusinessTests(unittest.TestCase):
             )
             self.assertTrue(bot.all_members_responded(2026, 8))
             bot.create_preview(2026, 8)
-            self.assertIn("Sara", fake.photos[0]["caption"])
-            self.assertNotIn("not confirmed", fake.photos[0]["caption"])
+            self.assertIn("Sara", fake.messages[-1]["text"])
+            self.assertNotIn("not confirmed", fake.messages[-1]["text"])
 
     def test_admin_approve_acknowledges_before_posting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1275,6 +1409,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
             write_schedule_config(bot_settings.schedule_config_path)
 
             repo = BotRepository(bot_settings.database_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
             fake = FakeTelegram()
             bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
             repo.set_state("active_survey", {"calendar": "gregorian", "year": 2026, "month": 8})

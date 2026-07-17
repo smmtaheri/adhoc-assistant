@@ -30,8 +30,8 @@ uv run python main.py --html output.html --image output.jpg
 
 ## Monthly Config
 
-The default config file is `adhoc_config.toml`. For each month, fill in `year`,
-`month`, people, unavailable days, and holidays.
+The default config file is `adhoc_config.toml`. Fill in `year`/`month` or a
+custom date range, output paths, and holidays. Team members live in SQLite.
 
 Dates default to the Jalali calendar. Configure the date system in the `date`
 section:
@@ -100,13 +100,14 @@ Run the one-shot CLI through Compose:
 docker compose --profile cli run --rm adhoc-assistant-cli
 ```
 
-Run an interactive debug Telegram flow:
+Run an interactive debug Telegram flow. Its defaults live in
+`bot_config.debug.toml`:
 
 ```bash
 docker compose --profile debug run --rm adhoc-assistant-debug
 ```
 
-Run a timed Telegram test using `ADHOC_SURVEY_START_AT` from `.env`:
+Run a timed Telegram test. Its defaults live in `bot_config.timed.toml`:
 
 ```bash
 docker compose --profile timed run --rm adhoc-assistant-timed
@@ -119,26 +120,88 @@ Configuration map:
 | File | What belongs here |
 |---|---|
 | `.env` | Secrets only, currently `TELEGRAM_BOT_TOKEN` |
-| `bot_config.toml` | Bot runtime settings: timezone, calendar, admin IDs, group/topic IDs, reminder time, paths |
-| `members.toml` | Real team roster: display name, Telegram ID, username, role, active/inactive |
-| `debug_members.toml` | Debug-only fake/local members, loaded only with `--debug` |
-| `adhoc_config.toml` | Manual CLI schedule config and shared schedule policy/holidays |
+| `bot_config.toml` | Bot runtime settings: timezone, calendar, reminder cadence, paths |
+| `bot_config.debug.toml` | Interactive debug defaults and isolated debug paths |
+| `bot_config.timed.toml` | Timed test defaults: target month, start delay, collect window, isolated paths |
+| SQLite DB | Allowed users, Telegram IDs, access levels, schedule participation, group/topic destination |
+| `adhoc_config.toml` | Manual CLI schedule policy, date/month/range, output, and holidays |
 | `docker-compose.yml` | Runtime wiring only: mounts, volumes, and command |
 
-Fill `bot_config.toml` with bot metadata, admin IDs, the target group chat ID,
-and the topic ID. Fill `members.toml` with each teammate's display name,
-Telegram ID, username, role, and `active` status. Keep the real bot token only in
-`.env`.
+Fill `bot_config.toml` with bot metadata and runtime timing/path settings. Keep
+the real bot token only in `.env`. Do not store real teammates, admins, or group
+destinations in committed files.
 
-Access is config-based. Active members in `members.toml` can use the bot for
-their own availability flow and status queries. IDs in `telegram.admin_ids` are
-admins and can approve/post schedules. Any other Telegram user is rejected before
-entering the flow.
+Users are DB-backed. First add allowed usernames to SQLite. When a person sends
+`/start`, the bot matches their Telegram username, stores their numeric Telegram
+ID and Telegram display name, and lets them enter any open survey.
+
+Add an admin who manages the flow but is not scheduled for bug-day duty:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --upsert-user some_admin_username \
+  --user-display-name "Some Admin" \
+  --user-role backend \
+  --user-access-level admin \
+  --user-manager-only
+```
+
+Add an admin who also participates in the schedule and must answer surveys:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --upsert-user admin_participant_username \
+  --user-display-name "Admin Participant" \
+  --user-role backend \
+  --user-access-level admin \
+  --user-schedule-participant
+```
+
+Add a normal member:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --upsert-user teammate_username \
+  --user-display-name "Teammate Name" \
+  --user-role frontend \
+  --user-access-level member
+```
+
+List DB users:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --list-users
+```
+
+Access is DB-based. Active users can use `/today` and answer surveys. Admin users
+can approve/post schedules. Only active users with `participates_in_schedule = 1`
+are snapshotted into surveys and assigned bug-day duty. Any other Telegram user
+is rejected before entering the flow.
 
 The bot asks active members for availability two days before the next month. Users
 can only answer with inline buttons: fully available, recurring unavailable
 weekdays, specific unavailable dates, and confirm. Choosing fully available locks
 the custom date controls until the user chooses `Change availability`.
+
+Every availability cycle is stored as a survey with a stable ID such as
+`S-jalali-1405-05-a1b2c3`. Member forms, callbacks, admin previews, responses,
+and canonical Telegram message IDs all point to that survey ID. Old buttons from
+an ended survey are rejected and their keyboard is removed instead of mutating the
+current survey. `/start` resumes the active survey form for that person instead
+of creating unlimited duplicate live forms.
 
 When the collection window closes, the bot sends admins a preview with a review
 report. Schedules with missing main/helper coverage are marked `blocked` and
@@ -148,20 +211,24 @@ everyone, rebuild the preview from current data, or cancel the cycle. After a
 revision starts, admins can close it immediately or reopen it for everyone. A
 canceled cycle shows a restart button so the same month can be collected again.
 After approval, the bot posts the image to the configured group topic, saves the
-month into SQLite, and sends the daily 09:00 reminder in that topic.
+month into SQLite, and sends the daily 09:00 reminder in that topic. If Telegram
+rejects pinning, the schedule is still posted and the admin gets the exact pin
+error.
 
 Authorized users can send `/today` to see today's bug day person and helper with
 their Telegram IDs. This works after a schedule has been approved and saved.
 
-For a timed test, set `ADHOC_SURVEY_START_AT`, `ADHOC_SURVEY_COLLECT_FOR`,
-`ADHOC_REVISION_COLLECT_FOR`, and `ADHOC_TARGET_MONTH` in `.env`.
-`ADHOC_SURVEY_START_AT` controls when the bot starts messaging members.
-`ADHOC_SURVEY_COLLECT_FOR` controls how long it waits before building the first
-preview. `ADHOC_REVISION_COLLECT_FOR` controls correction windows opened by an
-admin. These values accept forms like `+2m`, `+2h`, `+2d`, or an exact timestamp
-such as `2026-07-10 14:30`.
+For a timed test, edit `bot_config.timed.toml` instead of passing inline
+environment variables. The default timed profile targets Jalali `1405-05`, starts
+after `+2m`, waits `+10m` before building the first preview, and uses `+2h`
+correction windows. These values accept forms like `+2m`, `+2h`, `+2d`, or an
+exact timestamp such as `2026-07-10 14:30`.
 
-For an interactive debug run, enable debug mode:
+Relative `survey_start_at` values are one-shot start delays. They do not repeat
+forever and do not reset a collecting or reviewed survey.
+
+For an interactive debug run, `bot_config.debug.toml` already enables debug
+mode:
 
 ```toml
 [debug]
@@ -175,23 +242,124 @@ target month first so the test can be repeated from a clean form. Pressing
 `Confirm` creates the admin preview right away, so the whole approve/post flow
 can be tested without waiting for the monthly trigger.
 
-In debug mode, members from `debug_members.toml` are added to the real roster.
-Members with `telegram_id = 0` are local/config-only members. They do not receive
-Telegram messages and do not block collection, but their configured
-`unavailable_days` and `unavailable_weekdays` are included in the generated
-schedule. Normal mode ignores `debug_members.toml`.
+For custom CLI ranges, set both dates in `adhoc_config.toml`:
 
-The same test settings can be passed without editing the file when running
-locally:
+```toml
+[date]
+calendar = "jalali"
+start_date = "1405-05-10"
+end_date = "1405-06-10"
+```
+
+If `people` is omitted from `adhoc_config.toml`, the CLI loads active schedule
+participants from SQLite.
+
+### Local admin operations
+
+Admins can fully inspect and repair surveys from the local machine without adding
+every operation as an inline Telegram button.
+
+Set the DB-backed group/topic destination:
 
 ```bash
-uv run python -m adhoc_assistant.telegram_bot \
-  --config bot_config.toml \
-  --debug \
-  --survey-start-at "+2m" \
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --set-telegram-group-chat-id -100123456789 \
+  --set-telegram-topic-id 3
+```
+
+Show DB-backed runtime settings:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --show-runtime-settings
+```
+
+List surveys:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --list-surveys
+```
+
+Create a survey from the active DB roster:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
   --target-month 1405-05 \
-  --database data/debug_adhoc.sqlite3 \
-  --output-dir data/debug_output
+  --survey-start-at "+2m" \
+  --survey-collect-for "+4d" \
+  --create-survey
+```
+
+Send an existing scheduled survey:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --send-survey-id S-jalali-1405-05-a1b2c3
+```
+
+Cancel or edit a survey deadline:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --cancel-survey-id S-jalali-1405-05-a1b2c3
+
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --survey-id S-jalali-1405-05-a1b2c3 \
+  --set-survey-closes-at "+2d"
+```
+
+Edit an approved daily schedule entry and reminder time:
+
+```bash
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --set-schedule-entry-date 2026-08-01 \
+  --entry-main "New Main" \
+  --entry-backup "New Backup"
+
+docker compose run --rm adhoc-assistant-bot \
+  python -m adhoc_assistant.telegram_bot \
+  --config /app/bot_config.toml \
+  --database /app/data/adhoc_history.sqlite3 \
+  --set-daily-reminder-time 10:30
+```
+
+The daily reminder reads `schedule_entries` at send time, so editing that row
+changes who gets mentioned on the next reminder.
+
+The same profiles can run locally without Docker by pointing the bot at the
+matching config file:
+
+```bash
+uv run python -m adhoc_assistant.telegram_bot --config bot_config.debug.toml
+
+uv run python -m adhoc_assistant.telegram_bot \
+  --config bot_config.timed.toml \
+  --reset-target-month
 ```
 
 For a local run without Docker:

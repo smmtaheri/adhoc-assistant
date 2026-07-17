@@ -374,15 +374,16 @@ def export_html_calendar(
             border-radius: 999px;
             padding: 3px 8px;
             font-size: 0.68rem;
-            white-space: nowrap;
+            white-space: normal;
+            text-align: end;
+            line-height: 1.25;
         }}
 
         .helper-pill strong {{
             color: var(--text);
-            font-size: 0.72rem;
+            font-size: clamp(0.52rem, 0.72rem, 0.72rem);
             font-weight: 650;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            overflow-wrap: anywhere;
         }}
 
         @media (max-width: 820px) {{
@@ -455,6 +456,32 @@ def svg_text_lines(
     return clipped
 
 
+def svg_font_size_for_lines(
+    lines: list[str],
+    *,
+    base_size: int,
+    min_size: int,
+    comfortable_chars: int,
+) -> int:
+    longest = max((len(line) for line in lines), default=0)
+    if longest <= comfortable_chars:
+        return base_size
+    shrink = longest - comfortable_chars
+    return max(min_size, base_size - shrink)
+
+
+def svg_tspans(
+    lines: list[str],
+    *,
+    x: int,
+    line_height: int,
+) -> str:
+    return "".join(
+        f'<tspan x="{x}" dy="{0 if index == 0 else line_height}">{html.escape(line)}</tspan>'
+        for index, line in enumerate(lines)
+    )
+
+
 def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -> str:
     if item is None:
         return ""
@@ -462,13 +489,32 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
     current_day = internal_date(item)
     bg = DAY_PALETTE[current_day.day % len(DAY_PALETTE)]
     day_number = html.escape(str(item.get("day", current_day.day)))
-    main_lines = svg_text_lines(item["main"], max_chars=16, max_lines=2)
-    backup_lines = svg_text_lines(item["backup"], max_chars=20, max_lines=1)
-    main_markup = "".join(
-        f'<tspan x="{x + 18}" dy="{0 if index == 0 else 27}">{html.escape(line)}</tspan>'
-        for index, line in enumerate(main_lines)
+    main_lines = svg_text_lines(item["main"], max_chars=18, max_lines=3)
+    backup_lines = svg_text_lines(item["backup"], max_chars=23, max_lines=2)
+    main_size = svg_font_size_for_lines(
+        main_lines,
+        base_size=25,
+        min_size=15,
+        comfortable_chars=12,
     )
-    backup = html.escape(backup_lines[0])
+    backup_size = svg_font_size_for_lines(
+        backup_lines,
+        base_size=13,
+        min_size=9,
+        comfortable_chars=18,
+    )
+    main_line_height = max(17, main_size + 4)
+    backup_line_height = max(11, backup_size + 3)
+    main_y = y + 84 if len(main_lines) > 2 else y + 92
+    helper_box_height = 31 if len(backup_lines) == 1 else 44
+    helper_box_y = y + height - helper_box_height - 10
+    helper_text_y = helper_box_y + 19 if len(backup_lines) == 1 else helper_box_y + 16
+    main_markup = svg_tspans(main_lines, x=x + 18, line_height=main_line_height)
+    backup_markup = svg_tspans(
+        backup_lines,
+        x=x + width - 26,
+        line_height=backup_line_height,
+    )
     holiday = html.escape(item.get("holiday", ""))
     holiday_text = (
         f'<text x="{x + width - 14}" y="{y + 26}" text-anchor="end" '
@@ -486,11 +532,11 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
         {holiday_text}
         <line x1="{x + 12}" y1="{y + 52}" x2="{x + width - 12}" y2="{y + 52}"
               stroke="#deded8"/>
-        <text x="{x + 18}" y="{y + 92}" class="owner">{main_markup}</text>
-        <rect x="{x + 14}" y="{y + height - 39}" width="{width - 28}" height="27"
+        <text x="{x + 18}" y="{main_y}" class="owner" font-size="{main_size}px">{main_markup}</text>
+        <rect x="{x + 14}" y="{helper_box_y}" width="{width - 28}" height="{helper_box_height}"
               rx="13.5" fill="#ffffff" fill-opacity="0.78" stroke="#dddddd"/>
-        <text x="{x + width - 26}" y="{y + height - 20}" text-anchor="end"
-              class="helper">{backup}</text>
+        <text x="{x + width - 26}" y="{helper_text_y}" text-anchor="end"
+              class="helper" font-size="{backup_size}px">{backup_markup}</text>
     </g>
     """
 
@@ -686,8 +732,8 @@ def build_calendar_svg(
         .weekday {{ font: 850 17px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #55585f; }}
         .day-number {{ font: 900 17px "Noto Sans", sans-serif; fill: #19766d; }}
         .holiday {{ font: 800 13px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #7a4e00; }}
-        .owner {{ font: 900 25px "Noto Sans", sans-serif; fill: #202124; }}
-        .helper {{ font: 800 13px "Noto Sans", sans-serif; fill: #4f5358; }}
+        .owner {{ font-family: "Noto Sans", sans-serif; font-weight: 900; fill: #202124; }}
+        .helper {{ font-family: "Noto Sans", sans-serif; font-weight: 800; fill: #4f5358; }}
         .summary-title {{ font: 900 22px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #202124; }}
         .summary-head {{ font: 850 15px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #55585f; }}
         .summary-name {{ font: 800 16px "Noto Sans", sans-serif; fill: #202124; }}

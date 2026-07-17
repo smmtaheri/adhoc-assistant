@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .calendars import display_day, format_date, format_weekday, month_days
@@ -27,6 +27,20 @@ def month_workdays(year: int, month: int, calendar_type: str) -> list[date]:
 
         days.append(current)
 
+    return days
+
+
+def range_workdays(start_date: date, end_date: date) -> list[date]:
+    """Return all days in an inclusive custom range except Fridays."""
+    if end_date < start_date:
+        raise ValueError("end_date must be on or after start_date.")
+
+    days = []
+    current = start_date
+    while current <= end_date:
+        if current.weekday() != 4:
+            days.append(current)
+        current += timedelta(days=1)
     return days
 
 
@@ -132,7 +146,10 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
     history = add_history(db_history or {}, config.get("history", {}))
     holidays = config.get("holidays", {})
 
-    days = month_workdays(year, month, calendar_type)
+    if config.get("start_date") and config.get("end_date"):
+        days = range_workdays(config["start_date"], config["end_date"])
+    else:
+        days = month_workdays(year, month, calendar_type)
 
     stats = defaultdict(empty_person_stats)
     for person in people:
