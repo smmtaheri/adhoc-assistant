@@ -3,9 +3,11 @@ import unittest
 import re
 import shutil
 from pathlib import Path
-from PIL import Image
+from unittest import mock
 
-from adhoc_assistant.exporters import export_image_calendar
+from PIL import Image, UnidentifiedImageError
+
+from adhoc_assistant.exporters import export_image_calendar, write_svg_as_jpg
 
 
 def sample_schedule() -> list[dict]:
@@ -160,6 +162,42 @@ class ImageExporterTests(unittest.TestCase):
                 self.assertEqual(image.mode, "RGB")
                 self.assertGreater(image.width, 1000)
                 self.assertGreater(image.height, 700)
+
+    def test_jpg_export_reports_unreadable_intermediate_png_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "schedule.jpg"
+            bad_png = output_path.parent / ".render-tmp" / "case" / "schedule.png"
+
+            def fake_tempdir(*, dir: Path | str):
+                temp_dir = Path(dir) / "case"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+
+                class _TempDir:
+                    def __enter__(self_inner):
+                        return str(temp_dir)
+
+                    def __exit__(self_inner, exc_type, exc, tb):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+                return _TempDir()
+
+            def fake_run(cmd, check, capture_output, text):
+                bad_png.parent.mkdir(parents=True, exist_ok=True)
+                bad_png.write_text("not-a-real-png", encoding="utf-8")
+                return mock.Mock(stdout="", stderr="")
+
+            with (
+                mock.patch("adhoc_assistant.exporters.ensure_jpg_export_support"),
+                mock.patch("adhoc_assistant.exporters.shutil.which", return_value="/usr/bin/rsvg-convert"),
+                mock.patch("adhoc_assistant.exporters.tempfile.TemporaryDirectory", side_effect=fake_tempdir),
+                mock.patch("adhoc_assistant.exporters.subprocess.run", side_effect=fake_run),
+                mock.patch("adhoc_assistant.exporters.Image.open", side_effect=UnidentifiedImageError("bad png")),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    write_svg_as_jpg("<svg/>", output_path)
+
+            self.assertIn("unreadable PNG preview", str(ctx.exception))
+            self.assertIn(".render-tmp", str(ctx.exception))
 
 
 if __name__ == "__main__":

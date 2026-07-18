@@ -16,12 +16,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN UV_CACHE_DIR=/tmp/build-uv-cache XDG_CACHE_HOME=/tmp/build-xdg-cache HOME=/tmp uv sync --frozen --no-dev \
+    && rm -rf /tmp/build-uv-cache /tmp/build-xdg-cache
 
 COPY adhoc_assistant ./adhoc_assistant
 COPY main.py adhoc_config.toml ./
 
-RUN mkdir -p /app/data /app/output && chmod 0777 /app/data /app/output
+RUN mkdir -p /app/data /app/output
+
+ENV UV_CACHE_DIR=/tmp/runtime-uv-cache \
+    XDG_CACHE_HOME=/tmp/runtime-xdg-cache \
+    HOME=/tmp \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
 
 ENTRYPOINT ["uv", "run"]
-CMD ["python", "-m", "adhoc_assistant.telegram_bot", "--database", "/app/data/adhoc_history.sqlite3"]
+CMD ["python", "-m", "adhoc_assistant.telegram_bot"]

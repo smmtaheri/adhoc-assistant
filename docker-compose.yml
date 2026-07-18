@@ -2,53 +2,33 @@ services:
   adhoc-assistant-bot:
     build: .
     image: adhoc-assistant:latest
-    environment:
-      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/adhoc_history.sqlite3}
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    working_dir: /workspace
+    env_file:
+      - .env
     volumes:
-      - ./data:/app/data
-      - ./output:/app/data/output
-    command:
-      - python
-      - -m
-      - adhoc_assistant.telegram_bot
-      - --database
-      - /app/data/adhoc_history.sqlite3
+      - ./:/workspace
     restart: unless-stopped
-
-  adhoc-assistant-timed:
-    build: .
-    image: adhoc-assistant:latest
-    profiles:
-      - timed
-    environment:
-      DATABASE_URL: ${TIMED_DATABASE_URL:-sqlite:////app/data/timed_adhoc.sqlite3}
-    volumes:
-      - ./data:/app/data
-      - ./output/timed:/app/data/timed_output
-    command:
-      - python
-      - -m
-      - adhoc_assistant.telegram_bot
-      - --database
-      - /app/data/timed_adhoc.sqlite3
 
   adhoc-assistant-cli:
     build: .
     image: adhoc-assistant:latest
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    working_dir: /workspace
     profiles:
       - cli
+    env_file:
+      - .env
     volumes:
-      - ./adhoc_config.toml:/app/adhoc_config.toml:ro
-      - ./data:/app/data
-      - ./output:/app/data/output
+      - ./:/workspace
     command:
       - python
       - main.py
       - --db
-      - /app/data/adhoc_history.sqlite3
+      - adhoc_history.sqlite3
       - --csv
-      - /app/data/output/adhoc_schedule.csv
+      - data/output/adhoc_schedule.csv
       - --html
-      - /app/data/output/adhoc_schedule.html
+      - data/output/adhoc_schedule.html
       - --image
-      - /app/data/output/adhoc_schedule.jpg
+      - data/output/adhoc_schedule.jpg

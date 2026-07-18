@@ -6,7 +6,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from .calendars import format_month_title
 from .constants import (
@@ -676,6 +676,15 @@ def export_image_calendar(
     output_path.write_text(svg, encoding="utf-8")
 
 
+def ensure_jpg_export_support() -> None:
+    """Fail fast when the runtime cannot render JPG previews."""
+    if shutil.which("rsvg-convert") is None:
+        raise RuntimeError(
+            "rsvg-convert is required to export JPG calendar images. "
+            "Install librsvg2-bin (or run via the provided Docker/Compose image)."
+        )
+
+
 def build_calendar_svg(
     schedule: list[dict],
     year: int,
@@ -751,28 +760,40 @@ def build_calendar_svg(
 
 
 def write_svg_as_jpg(svg: str, output_path: Path) -> None:
+    ensure_jpg_export_support()
     converter = shutil.which("rsvg-convert")
     if converter is None:
         raise RuntimeError("rsvg-convert is required to export JPG calendar images.")
-
-    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as svg_file:
-        svg_path = Path(svg_file.name)
+    temp_root = output_path.parent / ".render-tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_root) as tmp_dir:
+        svg_path = Path(tmp_dir) / f"{output_path.stem}.svg"
+        png_path = Path(tmp_dir) / f"{output_path.stem}.png"
         svg_path.write_text(svg, encoding="utf-8")
 
-    png_path = svg_path.with_suffix(".png")
-    try:
-        subprocess.run(
-            [converter, "-z", "2", "-o", str(png_path), str(svg_path)],
+        result = subprocess.run(
+            [converter, "-z", "2", "-f", "png", "-o", str(png_path), str(svg_path)],
             check=True,
             capture_output=True,
+            text=True,
         )
-        with Image.open(png_path) as image:
-            background = Image.new("RGB", image.size, "#ffffff")
-            if image.mode == "RGBA":
-                background.paste(image, mask=image.split()[3])
-            else:
-                background.paste(image)
-            background.save(output_path, format="JPEG", quality=94, optimize=True)
-    finally:
-        svg_path.unlink(missing_ok=True)
-        png_path.unlink(missing_ok=True)
+        if not png_path.is_file() or png_path.stat().st_size == 0:
+            raise RuntimeError(
+                "rsvg-convert did not produce a PNG preview. "
+                f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
+            )
+        try:
+            with Image.open(png_path) as image:
+                background = Image.new("RGB", image.size, "#ffffff")
+                if image.mode == "RGBA":
+                    background.paste(image, mask=image.split()[3])
+                else:
+                    background.paste(image)
+                background.save(output_path, format="JPEG", quality=94, optimize=True)
+        except UnidentifiedImageError as exc:
+            header = png_path.read_bytes()[:32].hex()
+            raise RuntimeError(
+                "rsvg-convert produced an unreadable PNG preview. "
+                f"path={png_path} size={png_path.stat().st_size} header={header!r} "
+                f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
+            ) from exc

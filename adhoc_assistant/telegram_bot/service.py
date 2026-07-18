@@ -1,10 +1,11 @@
 import argparse
 import json
 import logging
+import os
 import re
 import time
 from copy import deepcopy
-from datetime import date, datetime, time as day_time, timedelta
+from datetime import date, datetime, time as day_time, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -17,9 +18,14 @@ from adhoc_assistant.calendars import (
     parse_calendar_date,
 )
 from adhoc_assistant.config import normalize_holidays
-from adhoc_assistant.exporters import export_image_calendar
+from adhoc_assistant.exporters import ensure_jpg_export_support, export_image_calendar
 from adhoc_assistant.scheduler import build_schedule, is_available, month_workdays, stats_to_plain_dict
 from adhoc_assistant.storage import load_history_from_db, save_month_to_db
+from adhoc_assistant.telegram_bot.access import (
+    access_denied_message,
+    resolve_allowlisted_member,
+    telegram_display_name,
+)
 from adhoc_assistant.telegram_bot.keyboards import (
     admin_canceled_keyboard,
     admin_approval_keyboard,
@@ -29,12 +35,14 @@ from adhoc_assistant.telegram_bot.keyboards import (
     main_availability_keyboard,
     weekdays_keyboard,
 )
+from adhoc_assistant.telegram_bot.messages import BOT_MESSAGE_KEYS, BotMessages
 from adhoc_assistant.telegram_bot.repository import (
     AvailabilityResponse,
     BotRepository,
     SURVEY_KIND_DEBUG,
     SURVEY_KIND_PRODUCTION,
     Survey,
+    display_name_or_username,
     normalize_username,
     schedule_person_key,
     stable_participant_id,
@@ -44,6 +52,7 @@ from adhoc_assistant.telegram_bot.settings import (
     InfraSettings,
     Member,
     RuntimeSettings,
+    load_env_file,
     load_infra_settings,
     resolve_database_path,
 )
@@ -78,7 +87,29 @@ CANCELABLE_STATUSES = {
     STATUS_REVISION_REQUESTED,
     STATUS_PUBLISHING,
 }
-ACTIVE_MEMBER_ERROR = "You are not in the active member list."
+ALL_SURVEY_STATUSES = {
+    STATUS_SCHEDULED,
+    STATUS_COLLECTING,
+    STATUS_PENDING_ADMIN_REVIEW,
+    STATUS_BLOCKED,
+    STATUS_REVISION_REQUESTED,
+    STATUS_PUBLISHING,
+    STATUS_APPROVED,
+    STATUS_CANCELED,
+}
+# --set-survey-status only allows these guarded recovery transitions.
+# Preview/revision/approve/publish stay on their real business flows.
+CLI_SURVEY_STATUS_TRANSITIONS: dict[str, set[str]] = {
+    STATUS_SCHEDULED: {STATUS_COLLECTING, STATUS_CANCELED},
+    STATUS_COLLECTING: {STATUS_CANCELED},
+    STATUS_PENDING_ADMIN_REVIEW: {STATUS_CANCELED},
+    STATUS_REVISION_REQUESTED: {STATUS_CANCELED},
+    STATUS_BLOCKED: {STATUS_CANCELED},
+    STATUS_PUBLISHING: {STATUS_CANCELED},
+}
+CLI_SETTABLE_SURVEY_STATUSES = sorted(
+    {target for targets in CLI_SURVEY_STATUS_TRANSITIONS.values() for target in targets}
+)
 TEMPORARY_TELEGRAM_ERROR = "Temporary Telegram problem. Please try again in a moment."
 TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 TELEGRAM_MESSAGE_TEXT_LIMIT = 4096
@@ -88,6 +119,80 @@ HIGH_UNAVAILABLE_EXTRA_DAYS = 3
 HIGH_UNAVAILABLE_RATIO = 0.35
 NO_MAIN = "NO_AVAILABLE_PERSON"
 NO_BACKUP = "NO_AVAILABLE_BACKUP"
+
+
+def configure_logging_from_env() -> None:
+    load_env_file(Path(".env"))
+    raw_level = (
+        os.environ.get("ADHOC_LOG_LEVEL")
+        or os.environ.get("LOG_LEVEL")
+        or "INFO"
+    )
+    level_name = raw_level.strip().upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level_name = "INFO"
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger(__name__).debug("Logging configured level=%s", level_name)
+
+
+def update_kind(update: dict) -> str:
+    if "callback_query" in update:
+        return "callback_query"
+    if "message" in update:
+        return "message"
+    return "unknown"
+
+
+def update_telegram_date(update: dict) -> tuple[float | None, str]:
+    if "message" in update:
+        raw_date = update.get("message", {}).get("date")
+        source = "message.date"
+    elif "callback_query" in update:
+        callback = update.get("callback_query", {})
+        raw_date = callback.get("message", {}).get("date")
+        source = "callback.message.date"
+    else:
+        raw_date = None
+        source = "none"
+    if raw_date is None:
+        return None, source
+    try:
+        return float(raw_date), source
+    except (TypeError, ValueError):
+        return None, source
+
+
+def epoch_utc_label(raw_epoch: float | None) -> str:
+    if raw_epoch is None:
+        return "unknown"
+    return datetime.fromtimestamp(raw_epoch, timezone.utc).isoformat()
+
+
+def update_age_seconds(update: dict, now: datetime | None = None) -> float | None:
+    now = now or datetime.now(timezone.utc)
+    raw_date, _source = update_telegram_date(update)
+    if raw_date is None:
+        return None
+    return max(0.0, now.timestamp() - raw_date)
+
+
+def resolve_cli_survey_kind(args: argparse.Namespace) -> str:
+    """Resolve survey kind for create/direct-preview/publish-now.
+
+    Explicit --survey-kind always wins. Otherwise --direct-preview / --publish-now
+    default to debug; other create paths default to production.
+    """
+    explicit = getattr(args, "survey_kind", None)
+    if explicit:
+        return explicit
+    if getattr(args, "direct_preview", False) or getattr(args, "publish_now", False):
+        return SURVEY_KIND_DEBUG
+    return SURVEY_KIND_PRODUCTION
 
 
 def next_month(year: int, month: int) -> tuple[int, int]:
@@ -597,6 +702,116 @@ def preview_report_message(
     )
 
 
+def availability_saved_message(calendar_type: str) -> str:
+    if calendar_type == "jalali":
+        return "ثبت شد."
+    return "Availability saved."
+
+
+def availability_saved_but_refresh_failed_message(calendar_type: str) -> str:
+    if calendar_type == "jalali":
+        return "ثبت شد، ولی فرم به‌روزرسانی نشد."
+    return "Saved, but the form could not be refreshed."
+
+
+def availability_confirmed_form_text(
+    survey: Survey,
+    response: AvailabilityResponse,
+    survey_label: str,
+) -> str:
+    return (
+        f"{availability_saved_message(survey.calendar_type)}\n\n"
+        + availability_summary(
+            response,
+            survey.calendar_type,
+            survey_label=survey_label,
+        )
+    )
+
+
+def assignment_summary_message(member: Member, survey: Survey, schedule: list[dict]) -> str:
+    main_days = []
+    backup_days = []
+    for item in schedule:
+        label = f"{item['date']} ({item['weekday']})"
+        if item.get("main") == member.name:
+            main_days.append(label)
+        if item.get("backup") == member.name:
+            backup_days.append(label)
+
+    if survey.calendar_type == "jalali":
+        lines = [
+            f"برنامه‌ی {month_label(survey.year, survey.month, survey.calendar_type)} منتشر شد.",
+            f"روزهای اصلی: {len(main_days)}",
+        ]
+        lines.extend(f"- {item}" for item in main_days)
+        lines.append(f"روزهای پشتیبان: {len(backup_days)}")
+        lines.extend(f"- {item}" for item in backup_days)
+        lines.append(f"مجموع: {len(main_days) + len(backup_days)}")
+        return "\n".join(lines)
+
+    lines = [
+        f"The {month_label(survey.year, survey.month, survey.calendar_type)} schedule is live.",
+        f"Main days: {len(main_days)}",
+    ]
+    lines.extend(f"- {item}" for item in main_days)
+    lines.append(f"Backup days: {len(backup_days)}")
+    lines.extend(f"- {item}" for item in backup_days)
+    lines.append(f"Total: {len(main_days) + len(backup_days)}")
+    return "\n".join(lines)
+
+
+def display_label_for_member(repo: BotRepository, member: Member) -> str:
+    username = normalize_username(member.username)
+    if username:
+        user = repo.get_user_by_username(username)
+        if user is not None:
+            return display_name_or_username(user["display_name"], user["username"])
+    return display_name_or_username(member.name, member.username)
+
+
+def relabel_schedule_outputs(
+    repo: BotRepository,
+    *,
+    schedule: list[dict],
+    stats: dict,
+    review: dict,
+    members: list[Member],
+) -> tuple[list[dict], dict, dict]:
+    label_by_key = {
+        schedule_person_key(member): display_label_for_member(repo, member)
+        for member in schedule_members(members)
+    }
+
+    def relabel_name(name: str) -> str:
+        return label_by_key.get(name, name)
+
+    relabeled_schedule = [
+        {
+            **item,
+            "main": relabel_name(item["main"]),
+            "backup": relabel_name(item["backup"]),
+        }
+        for item in schedule
+    ]
+    relabeled_stats = {
+        relabel_name(name): values for name, values in stats_to_plain_dict(stats).items()
+    }
+    relabeled_review = deepcopy(review)
+    for warning in relabeled_review.get("coverage_warnings", []):
+        warning["available"] = [relabel_name(name) for name in warning.get("available", [])]
+        warning["unavailable"] = [relabel_name(name) for name in warning.get("unavailable", [])]
+    relabeled_review["flagged_member_names"] = [
+        relabel_name(name) for name in relabeled_review.get("flagged_member_names", [])
+    ]
+    relabeled_review["unregistered_member_names"] = [
+        relabel_name(name) for name in relabeled_review.get("unregistered_member_names", [])
+    ]
+    for item in relabeled_review.get("availability", []):
+        item["name"] = relabel_name(item["name"])
+    return relabeled_schedule, relabeled_stats, relabeled_review
+
+
 def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_TEXT_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -622,18 +837,6 @@ def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_TEXT_LIMIT) -> 
     if current:
         chunks.append(current.rstrip())
     return chunks
-
-
-def unauthorized_message(calendar_type: str) -> str:
-    if calendar_type == "jalali":
-        return "شما اجازه ندارید با این بات صحبت کنید."
-    return "You are not allowed to use this bot."
-
-
-def no_schedule_for_today_message(calendar_type: str) -> str:
-    if calendar_type == "jalali":
-        return "برای امروز برنامه‌ی ادهاک ثبت نشده است."
-    return "There is no bug day schedule for today."
 
 
 def today_bug_day_message(
@@ -673,12 +876,6 @@ def mention(member: Member) -> str:
     return member.name
 
 
-def telegram_display_name(user: dict | None) -> str:
-    if not user:
-        return ""
-    return str(user.get("first_name", "")).strip()
-
-
 def format_names(names: list[str], calendar_type: str) -> str:
     if not names:
         return "هیچ‌کس" if calendar_type == "jalali" else "nobody"
@@ -714,6 +911,10 @@ class AdhocTelegramBot:
         return self._runtime_cache
 
     @property
+    def messages(self) -> BotMessages:
+        return self.runtime.bot_messages
+
+    @property
     def calendar_type(self) -> str:
         return normalize_calendar_type(self.runtime.calendar)
 
@@ -722,14 +923,11 @@ class AdhocTelegramBot:
         return self.runtime.timezone
 
     def find_active_member(self, telegram_id: int) -> Member | None:
-        return next(
-            (
-                member
-                for member in self.members
-                if member.telegram_id == telegram_id and member.active
-            ),
-            None,
-        )
+        """Allowlisted active bot_users row bound to this Telegram id."""
+        user = self.repo.get_user_by_telegram_id(int(telegram_id))
+        if user is None or not user["active"]:
+            return None
+        return self.repo.user_to_member(user)
 
     def find_active_member_by_telegram_id(self, telegram_id: int) -> Member | None:
         return self.find_active_member(telegram_id)
@@ -752,8 +950,7 @@ class AdhocTelegramBot:
         return sorted(ids)
 
     def is_authorized_user(self, telegram_id: int) -> bool:
-        self.refresh_members()
-        return self.is_admin(telegram_id) or self.find_active_member(telegram_id) is not None
+        return self.find_active_member(telegram_id) is not None
 
     def member_by_name(self) -> dict[str, Member]:
         """Lookup by schedule key (username) and display name for legacy rows."""
@@ -866,9 +1063,11 @@ class AdhocTelegramBot:
         return None
 
     def survey_state_for(self, survey: Survey) -> dict:
-        phase_state = self.repo.get_active_survey_phase(survey.kind) or {}
-        if phase_state.get("id") == survey.id:
-            return phase_state
+        """Runtime view of survey state.
+
+        surveys.status and surveys.closes_at are authoritative. Revision
+        targeting allowlists come from the active_survey:{kind} blob only.
+        """
         return {
             "id": survey.id,
             "kind": survey.kind,
@@ -877,7 +1076,7 @@ class AdhocTelegramBot:
             "month": survey.month,
             "phase": survey.status,
             "collect_until": survey.closes_at,
-            "allowed_member_ids": phase_state.get("allowed_member_ids", []),
+            "allowed_member_ids": self.repo.get_revision_allowlist(survey),
         }
 
     def active_or_latest_survey_for_month(
@@ -898,26 +1097,11 @@ class AdhocTelegramBot:
         )
 
     def persist_member_response(self, survey: Survey, response: AvailabilityResponse) -> None:
+        # survey_responses is the only writable response store.
         self.repo.save_survey_response(survey.id, response)
-        if survey.kind == SURVEY_KIND_PRODUCTION:
-            self.repo.save_response(
-                survey.calendar_type,
-                survey.year,
-                survey.month,
-                response,
-            )
 
     def responses_for_survey(self, survey: Survey) -> dict[int, AvailabilityResponse]:
-        responses = self.repo.list_survey_responses(survey.id)
-        if survey.kind != SURVEY_KIND_PRODUCTION:
-            return responses
-        legacy = self.repo.list_responses(survey.calendar_type, survey.year, survey.month)
-        for telegram_id, response in legacy.items():
-            if telegram_id in responses:
-                continue
-            self.repo.save_survey_response(survey.id, response)
-            responses[telegram_id] = response
-        return responses
+        return self.repo.list_survey_responses(survey.id)
 
     def configured_closes_at(self, now: datetime, raw_value: str | None = None) -> str:
         raw = self.runtime.survey_collect_for if raw_value is None else raw_value
@@ -936,6 +1120,7 @@ class AdhocTelegramBot:
         created_by: str = "auto",
         kind: str = SURVEY_KIND_PRODUCTION,
         participants: list[Member] | None = None,
+        replace_active: bool = False,
     ) -> Survey:
         self.refresh_members()
         starts_at = starts_at or now
@@ -955,8 +1140,9 @@ class AdhocTelegramBot:
             created_by=created_by,
             participants=participants or schedule_members(self.members),
             kind=kind,
+            replace_active=replace_active,
         )
-        self.repo.set_active_survey_phase(survey)
+        self.repo.clear_revision_allowlist(kind)
         return survey
 
     def start_collecting(self, year: int, month: int, now: datetime | None = None) -> None:
@@ -969,7 +1155,7 @@ class AdhocTelegramBot:
                 now,
                 starts_at=now,
                 status=STATUS_COLLECTING,
-                created_by="legacy-start_collecting",
+                created_by="start_collecting",
             )
         else:
             self.repo.update_survey(
@@ -979,12 +1165,7 @@ class AdhocTelegramBot:
                 closes_at=survey.closes_at or self.configured_closes_at(now),
             )
             survey = self.repo.get_survey(survey.id) or survey
-        self.repo.set_active_survey_phase(
-            survey,
-            phase=STATUS_COLLECTING,
-            collect_until=survey.closes_at,
-            allowed_member_ids=[],
-        )
+        self.repo.clear_revision_allowlist(survey.kind)
 
     def start_revision(
         self,
@@ -1007,12 +1188,10 @@ class AdhocTelegramBot:
                 f"Cannot start revision from status {status}; expected pending_admin_review."
             )
         survey = self.repo.get_survey(survey.id) or survey
-        self.repo.set_active_survey_phase(
-            survey,
-            phase=STATUS_REVISION_REQUESTED,
-            collect_until=closes_at,
-            allowed_member_ids=sorted(set(member_ids)),
-        )
+        allowed = sorted(set(member_ids))
+        # Prior confirms must not satisfy revision; members get a real re-confirm window.
+        self.repo.unconfirm_survey_responses(survey.id, allowed)
+        self.repo.set_revision_allowlist(survey, allowed)
         return survey
 
     def deadline_at(self, raw_value: str, now: datetime) -> datetime | None:
@@ -1167,7 +1346,7 @@ class AdhocTelegramBot:
                 now,
                 starts_at=now,
                 status=STATUS_COLLECTING,
-                created_by="legacy-send_survey",
+                created_by="send_survey",
             )
         self.send_survey_by_id(survey.id, now)
 
@@ -1200,12 +1379,7 @@ class AdhocTelegramBot:
             except TelegramApiError as exc:
                 failed_members.append(f"{member.name}: {exc}")
 
-        self.repo.set_active_survey_phase(
-            survey,
-            phase=STATUS_COLLECTING,
-            collect_until=survey.closes_at,
-            allowed_member_ids=[],
-        )
+        self.repo.clear_revision_allowlist(survey.kind)
         state = self.survey_state_for(survey)
         logger.info(
             "Availability survey %s for %s/%s is collecting; collect_until=%s.",
@@ -1263,17 +1437,24 @@ class AdhocTelegramBot:
                 message_id,
             )
 
-    def ensure_month_started_preview(self, today: date | None = None) -> None:
+    def maybe_activate_due_live_schedule(self, today: date | None = None) -> None:
+        """Switch live reminders to the current calendar month when its schedule exists.
+
+        Approving a future month early writes schedule_entries but must not move
+        active_schedule_source until that month becomes current.
+        """
         today = today or datetime.now(ZoneInfo(self.timezone_name)).date()
         year, month = current_calendar_month(today, self.calendar_type)
-        if today != calendar_month_start(year, month, self.calendar_type):
+        source = self.repo.get_active_schedule_source()
+        if source == (year, month):
             return
-
-        if self.repo.get_monthly_run(self.calendar_type, year, month):
-            return
-
-        self.start_collecting(year, month)
-        self.create_preview(year, month)
+        if self.repo.has_schedule_month(year, month):
+            self.repo.set_active_schedule_source(year, month)
+            logger.info(
+                "Live reminder schedule activated for current month %s/%s.",
+                year,
+                month,
+            )
 
     def survey_by_callback_parts(self, data: str) -> tuple[Survey | None, str, list[str]]:
         parts = data.split(":")
@@ -1286,8 +1467,12 @@ class AdhocTelegramBot:
         action = parts[2]
         return survey, action, parts[3:]
 
-    def stale_survey_callback(self, callback: dict, message: str = "This survey has ended.") -> None:
-        self.safe_answer_callback_query(callback["id"], message, show_alert=True)
+    def stale_survey_callback(self, callback: dict, message: str | None = None) -> None:
+        self.safe_answer_callback_query(
+            callback["id"],
+            message if message is not None else self.messages.survey_ended,
+            show_alert=True,
+        )
         self.remove_callback_buttons(callback)
 
     def survey_is_current_and_editable(self, survey: Survey) -> bool:
@@ -1308,11 +1493,6 @@ class AdhocTelegramBot:
         if debug is not None:
             return self.survey_state_for(debug)
         return None
-
-    def survey_closed_message(self) -> str:
-        if self.calendar_type == "jalali":
-            return "مهلت ثبت availability تمام شده است. اگر نیاز به اصلاح داری با ادمین هماهنگ کن."
-        return "The availability window is closed. Contact an admin if you need a change."
 
     def member_can_edit_survey(
         self,
@@ -1335,36 +1515,29 @@ class AdhocTelegramBot:
         return main_availability_keyboard(response, survey_id=survey_id)
 
     def authorize_from_start(self, chat_id: int, user: dict | None) -> Member | None:
-        existing_member = self.find_active_member(chat_id)
-        display_name = telegram_display_name(user)
-        if existing_member is not None:
-            self.repo.mark_user_seen(chat_id, display_name)
-            self.refresh_members()
-            return self.find_active_member(chat_id)
+        """Allowlist-only: bind telegram_id on first /start for a pre-registered username."""
+        return resolve_allowlisted_member(
+            self.repo,
+            telegram_id=chat_id,
+            username=str((user or {}).get("username", "")),
+            display_name=telegram_display_name(user),
+        )
 
-        username = normalize_username(str((user or {}).get("username", "")))
-        if not username:
-            return None
-
-        authorized = self.repo.authorize_user_from_start(username, chat_id, display_name)
-        if authorized is None:
-            return None
-
-        self.refresh_members()
-        return self.find_active_member(chat_id)
+    def deny_access(self, chat_id: int, user: dict | None = None) -> str:
+        return access_denied_message(
+            self.repo,
+            self.messages,
+            telegram_id=chat_id,
+            username=str((user or {}).get("username", "")),
+        )
 
     def start_member_survey(self, chat_id: int, user: dict | None = None) -> None:
-        self.refresh_members()
         member = self.authorize_from_start(chat_id, user)
-        if member is None and not self.is_authorized_user(chat_id):
-            self.telegram.send_message(chat_id, unauthorized_message(self.calendar_type))
-            return
-
-        member = member or self.find_active_member(chat_id)
         if member is None:
-            self.telegram.send_message(chat_id, ACTIVE_MEMBER_ERROR)
+            self.telegram.send_message(chat_id, self.deny_access(chat_id, user))
             return
 
+        self.refresh_members()
         survey = self.editable_survey_for_member(member)
         if survey is not None:
             response = response_for_survey_member(self.repo, survey.id, member)
@@ -1373,10 +1546,10 @@ class AdhocTelegramBot:
             return
 
         if self.participant_in_active_survey(member):
-            self.telegram.send_message(chat_id, self.survey_closed_message())
+            self.telegram.send_message(chat_id, self.messages.survey_closed)
             return
 
-        self.telegram.send_message(chat_id, "There is no active availability survey right now.")
+        self.telegram.send_message(chat_id, self.messages.no_active_survey)
 
     def participant_in_active_survey(self, member: Member) -> bool:
         for kind in (SURVEY_KIND_PRODUCTION, SURVEY_KIND_DEBUG):
@@ -1396,17 +1569,19 @@ class AdhocTelegramBot:
             self.start_member_survey(chat_id, user)
             return
 
-        if not self.is_authorized_user(chat_id):
-            self.telegram.send_message(chat_id, unauthorized_message(self.calendar_type))
+        member = resolve_allowlisted_member(
+            self.repo,
+            telegram_id=chat_id,
+            username=str((user or {}).get("username", "")),
+            display_name=telegram_display_name(user),
+        )
+        if member is None:
+            self.telegram.send_message(chat_id, self.deny_access(chat_id, user))
             return
 
+        self.refresh_members()
         if self.is_today_command(text):
             self.send_today_bug_day(chat_id)
-            return
-
-        member = self.find_active_member(chat_id)
-        if member is None:
-            self.telegram.send_message(chat_id, ACTIVE_MEMBER_ERROR)
             return
 
         survey = self.editable_survey_for_member(member)
@@ -1417,10 +1592,10 @@ class AdhocTelegramBot:
             return
 
         if self.participant_in_active_survey(member):
-            self.telegram.send_message(chat_id, self.survey_closed_message())
+            self.telegram.send_message(chat_id, self.messages.survey_closed)
             return
 
-        self.telegram.send_message(chat_id, "There is no active availability survey right now.")
+        self.telegram.send_message(chat_id, self.messages.no_active_survey)
 
     def is_today_command(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -1431,7 +1606,7 @@ class AdhocTelegramBot:
         self.refresh_members()
         entry = self.repo.get_schedule_entry(now.date().isoformat())
         if entry is None:
-            self.telegram.send_message(chat_id, no_schedule_for_today_message(self.calendar_type))
+            self.telegram.send_message(chat_id, self.messages.no_schedule_today)
             return
 
         main_name, backup_name = entry
@@ -1448,18 +1623,64 @@ class AdhocTelegramBot:
         )
 
     def handle_availability_callback(self, callback: dict) -> None:
+        callback_started = time.monotonic()
+        last_step = callback_started
+        debug_timing = logger.isEnabledFor(logging.DEBUG)
+
+        def log_step(step: str, **fields) -> None:
+            nonlocal last_step
+            if not debug_timing:
+                return
+            now = time.monotonic()
+            extras = " ".join(f"{key}={value}" for key, value in fields.items())
+            logger.debug(
+                "availability callback step=%s delta_ms=%.1f total_ms=%.1f%s%s",
+                step,
+                (now - last_step) * 1000,
+                (now - callback_started) * 1000,
+                " " if extras else "",
+                extras,
+            )
+            last_step = now
+
+        log_step(
+            "start",
+            callback_id=callback.get("id"),
+            user_id=(callback.get("from") or {}).get("id"),
+            data=callback.get("data", ""),
+        )
         self.refresh_members()
+        log_step("refresh_members")
         survey, action, args = self.survey_by_callback_parts(callback.get("data", ""))
+        log_step(
+            "parse_callback",
+            survey_id=survey.id if survey else "missing",
+            action=action,
+        )
         if survey is None:
-            self.stale_survey_callback(callback, "This survey has ended.")
+            self.stale_survey_callback(callback, self.messages.survey_ended)
+            log_step("stale_missing_survey")
             return
 
         user = callback["from"]
         telegram_id = int(user["id"])
-
-        member = self.find_active_member(telegram_id)
+        member = resolve_allowlisted_member(
+            self.repo,
+            telegram_id=telegram_id,
+            username=str(user.get("username", "")),
+            display_name=telegram_display_name(user),
+        )
+        log_step(
+            "resolve_member",
+            member=member.name if member else "denied",
+            telegram_id=telegram_id,
+        )
         if member is None:
-            self.safe_answer_callback_query(callback["id"], unauthorized_message(self.calendar_type))
+            self.safe_answer_callback_query(
+                callback["id"],
+                self.deny_access(telegram_id, user),
+            )
+            log_step("deny_member")
             return
         if not self.survey_is_current_and_editable(survey):
             active = self.repo.get_active_survey(survey.kind)
@@ -1468,17 +1689,21 @@ class AdhocTelegramBot:
                 or active is None
                 or active.id != survey.id
             ):
-                self.stale_survey_callback(callback, "This survey has ended.")
+                self.stale_survey_callback(callback, self.messages.survey_ended)
             else:
-                self.stale_survey_callback(callback, self.survey_closed_message())
+                self.stale_survey_callback(callback, self.messages.survey_closed)
+            log_step("stale_or_closed", survey_status=survey.status)
             return
 
         state = self.survey_state_for(survey)
+        log_step("load_survey_state", phase=state.get("phase"))
         if not self.member_can_edit_survey(member, survey, state):
-            self.stale_survey_callback(callback, self.survey_closed_message())
+            self.stale_survey_callback(callback, self.messages.survey_closed)
+            log_step("member_cannot_edit")
             return
 
         response = response_for_survey_member(self.repo, survey.id, member)
+        log_step("load_response", confirmed=response.confirmed, mode=response.mode)
 
         if action == "full":
             response.unavailable_days = []
@@ -1529,32 +1754,84 @@ class AdhocTelegramBot:
             reply_markup = dates_keyboard(response, survey.year, survey.month, survey.calendar_type, survey.id)
         else:
             self.safe_answer_callback_query(callback["id"])
+            log_step("unsupported_or_noop_action", action=action)
             return
+        log_step("apply_action_build_markup", action=action)
 
-        self.safe_answer_callback_query(callback["id"])
-
+        save_like_actions = {"confirm", "full"}
+        success_notice = (
+            availability_saved_message(survey.calendar_type) if action in save_like_actions else ""
+        )
         try:
             self.persist_member_response(survey, response)
+            log_step("persist_response", confirmed=response.confirmed, mode=response.mode)
+        except Exception as exc:
+            logger.warning("Availability save failed for %s: %s", member.name, exc)
+            self.safe_answer_callback_query(callback["id"], TEMPORARY_TELEGRAM_ERROR)
+            log_step("persist_response_failed")
+            return
+
+        is_final_confirm = action == "confirm"
+        try:
             self.telegram.edit_message_text(
                 chat_id=callback["message"]["chat"]["id"],
                 message_id=callback["message"]["message_id"],
-                text=self.survey_form_text(survey, response),
-                reply_markup=reply_markup,
+                text=(
+                    availability_confirmed_form_text(
+                        survey,
+                        response,
+                        self.survey_label(survey),
+                    )
+                    if is_final_confirm
+                    else self.survey_form_text(survey, response)
+                ),
+                reply_markup=None if is_final_confirm else reply_markup,
             )
+            log_step("telegram_edit_message_text", final_confirm=is_final_confirm)
             self.repo.record_survey_message(
                 survey.id,
                 telegram_id,
                 int(callback["message"]["chat"]["id"]),
                 int(callback["message"]["message_id"]),
             )
+            log_step("record_survey_message")
+            self.safe_answer_callback_query(callback["id"], "" if is_final_confirm else success_notice)
+            log_step("telegram_answer_callback", final_confirm=is_final_confirm)
+            if is_final_confirm:
+                self.safe_send_message(
+                    chat_id=telegram_id,
+                    text=availability_saved_message(survey.calendar_type),
+                )
+                log_step("telegram_send_confirmation")
         except TelegramApiError as exc:
+            if self.is_ignorable_telegram_error(exc):
+                self.safe_answer_callback_query(
+                    callback["id"],
+                    "" if is_final_confirm else success_notice,
+                )
+                log_step("telegram_edit_ignorable", final_confirm=is_final_confirm)
+                if is_final_confirm:
+                    self.safe_send_message(
+                        chat_id=telegram_id,
+                        text=availability_saved_message(survey.calendar_type),
+                    )
+                    log_step("telegram_send_confirmation_after_ignorable")
+                return
+
             if not self.is_ignorable_telegram_error(exc):
                 logger.warning("Availability callback failed for %s: %s", member.name, exc)
                 self.safe_send_message(
                     chat_id=telegram_id,
-                    text=TEMPORARY_TELEGRAM_ERROR,
+                    text=(
+                        availability_saved_but_refresh_failed_message(survey.calendar_type)
+                        if action in save_like_actions
+                        else TEMPORARY_TELEGRAM_ERROR
+                    ),
                 )
+                log_step("telegram_callback_failed", final_confirm=is_final_confirm)
                 return
+            self.safe_answer_callback_query(callback["id"], success_notice)
+            log_step("telegram_answer_after_unexpected_ignorable_path")
 
     def required_response_members(self, survey: Survey | None = None) -> list[Member]:
         if survey is None:
@@ -1566,7 +1843,7 @@ class AdhocTelegramBot:
         members = [
             member
             for member in self.repo.list_survey_participants(survey.id)
-            if can_receive_telegram_messages(member)
+            if not is_local_only_member(member)
         ]
         if phase != STATUS_REVISION_REQUESTED:
             return members
@@ -1576,9 +1853,8 @@ class AdhocTelegramBot:
     def all_members_responded(self, year: int, month: int, survey: Survey | None = None) -> bool:
         survey = survey or self.active_or_latest_survey_for_month(year, month)
         if survey is None:
-            responses = self.repo.list_responses(self.calendar_type, year, month)
-        else:
-            responses = self.responses_for_survey(survey)
+            return False
+        responses = self.responses_for_survey(survey)
         for member in self.required_response_members(survey):
             response = responses.get(member.telegram_id)
             if response is None or not response.confirmed:
@@ -1598,8 +1874,8 @@ class AdhocTelegramBot:
         survey = survey or self.active_survey_record(SURVEY_KIND_PRODUCTION)
         if survey is None:
             return False
-        state = self.survey_state_for(survey)
-        collect_until_raw = state.get("collect_until") or survey.closes_at
+        # surveys.closes_at is the only deadline source of truth.
+        collect_until_raw = survey.closes_at
         if not collect_until_raw:
             return False
 
@@ -1610,45 +1886,46 @@ class AdhocTelegramBot:
         return now >= collect_until
 
     def maybe_create_preview(self, today: date | datetime | None = None) -> None:
-        survey = self.active_survey_record(SURVEY_KIND_PRODUCTION)
-        if not survey:
-            return
-
-        if survey.status in {
-            STATUS_SCHEDULED,
-            STATUS_PENDING_ADMIN_REVIEW,
-            STATUS_BLOCKED,
-            STATUS_PUBLISHING,
-            STATUS_APPROVED,
-            STATUS_CANCELED,
-        }:
-            return
-
         if isinstance(today, datetime):
             now = today.astimezone(ZoneInfo(self.timezone_name))
             today = now.date()
         else:
             now = datetime.now(ZoneInfo(self.timezone_name))
             today = today or now.date()
-        if (
-            not self.all_members_responded(survey.year, survey.month, survey)
-            and not self.deadline_reached(today, survey.year, survey.month)
-            and not self.collection_deadline_reached(now)
-        ):
-            return
 
-        self.create_preview(survey.year, survey.month, survey_id=survey.id)
+        for kind in (SURVEY_KIND_PRODUCTION, SURVEY_KIND_DEBUG):
+            survey = self.active_survey_record(kind)
+            if not survey:
+                continue
+            if survey.status in {
+                STATUS_SCHEDULED,
+                STATUS_PENDING_ADMIN_REVIEW,
+                STATUS_BLOCKED,
+                STATUS_PUBLISHING,
+                STATUS_APPROVED,
+                STATUS_CANCELED,
+            }:
+                continue
+
+            responded = self.all_members_responded(survey.year, survey.month, survey)
+            collect_deadline = self.collection_deadline_reached(now, survey=survey)
+            if survey.status == STATUS_REVISION_REQUESTED:
+                # Revision waits for re-confirms or the revision collect window.
+                # Month-start alone must not close a revision immediately.
+                if not responded and not collect_deadline:
+                    continue
+            elif not responded and not collect_deadline:
+                continue
+
+            self.create_preview(survey.year, survey.month, survey_id=survey.id)
 
     def create_preview(self, year: int, month: int, survey_id: str | None = None) -> None:
         self.refresh_members()
         survey = self.repo.get_survey(survey_id) if survey_id else self.active_or_latest_survey_for_month(year, month)
         if survey is None:
-            survey = self.create_survey_record(
-                year,
-                month,
-                datetime.now(ZoneInfo(self.timezone_name)),
-                status=STATUS_COLLECTING,
-                created_by="legacy-preview",
+            raise RuntimeError(
+                f"No survey found for preview ({self.calendar_type} {year}-{month:02d}). "
+                "Create and collect a survey first."
             )
         base_config = {
             "calendar": survey.calendar_type,
@@ -1694,6 +1971,13 @@ class AdhocTelegramBot:
             year=survey.year,
             month=survey.month,
         )
+        schedule, stats, review = relabel_schedule_outputs(
+            self.repo,
+            schedule=schedule,
+            stats=stats,
+            review=review,
+            members=participants,
+        )
         status = STATUS_PENDING_ADMIN_REVIEW
 
         output_dir = self.resolve_output_dir()
@@ -1734,7 +2018,7 @@ class AdhocTelegramBot:
             preview_sent_at=utc_now(),
             image_path=str(image_path),
             schedule_json=json.dumps(schedule),
-            stats_json=json.dumps(stats_to_plain_dict(stats)),
+            stats_json=json.dumps(stats),
             review_json=json.dumps(review),
         ):
             current = self.repo.get_survey(survey.id)
@@ -1743,12 +2027,8 @@ class AdhocTelegramBot:
                 f"{current.status if current else 'missing'} for survey {survey.id}."
             )
         survey = self.repo.get_survey(survey.id) or survey
-        self.repo.set_active_survey_phase(
-            survey,
-            phase=status,
-            collect_until=survey.closes_at,
-            allowed_member_ids=[],
-        )
+        # Preview ends any revision window; allowlist is no longer needed.
+        self.repo.clear_revision_allowlist(survey.kind)
 
         failed_admins: list[str] = []
         delivered_admin_ids: list[int] = []
@@ -1796,13 +2076,10 @@ class AdhocTelegramBot:
         try:
             return self.ensure_writable_dir(configured)
         except OSError as exc:
-            fallback = self.settings.database_path.parent / "output"
-            logger.warning(
-                "Configured output_dir is not writable: %s. Falling back to %s",
-                exc,
-                fallback,
-            )
-            return self.ensure_writable_dir(fallback)
+            raise RuntimeError(
+                f"Configured output_dir is not writable: {configured}. "
+                "Fix runtime_settings.output_dir to a writable path."
+            ) from exc
 
     def ensure_writable_dir(self, path: Path) -> Path:
         path.mkdir(parents=True, exist_ok=True)
@@ -2032,12 +2309,37 @@ class AdhocTelegramBot:
         )
 
     def finalize_published_survey(self, survey: Survey) -> None:
-        if not self.repo.complete_publish(survey.id):
+        today = datetime.now(ZoneInfo(self.timezone_name)).date()
+        # Only cut over live reminders when the published month is already current.
+        activate_live = (
+            survey.kind == SURVEY_KIND_PRODUCTION
+            and current_calendar_month(today, survey.calendar_type) == (survey.year, survey.month)
+        )
+        if not self.repo.complete_publish(survey.id, activate_live=activate_live):
             current = self.repo.get_survey(survey.id)
             if current is None or current.status != STATUS_APPROVED:
                 raise RuntimeError(
                     f"Failed to finalize publish for survey {survey.id} "
                     f"(status={current.status if current else 'missing'})."
+                )
+
+    def notify_members_schedule_published(self, survey: Survey) -> None:
+        if not survey.schedule_json:
+            return
+        schedule = json.loads(survey.schedule_json)
+        for member in self.repo.list_survey_participants(survey.id):
+            if not can_receive_telegram_messages(member):
+                continue
+            try:
+                self.telegram.send_message(
+                    chat_id=member.telegram_id,
+                    text=assignment_summary_message(member, survey, schedule),
+                )
+            except TelegramApiError as exc:
+                logger.warning(
+                    "Published schedule notification failed for %s: %s",
+                    member.name,
+                    exc,
                 )
 
     def publish_survey(self, survey: Survey) -> TelegramApiError | None:
@@ -2063,6 +2365,15 @@ class AdhocTelegramBot:
                 "manually activate/finalize it with local DB commands."
             )
 
+        # Validate destination and image before claiming publishing — avoid wedging
+        # on failures that are known before any Telegram side effect.
+        group_chat_id, topic_id = self.telegram_destination()
+        image_path = Path(survey.image_path or "")
+        if not image_path.is_file():
+            raise RuntimeError(
+                f"Cannot publish survey {survey.id}: preview image missing at {image_path}."
+            )
+
         if not self.repo.transition_survey(
             survey.id,
             from_statuses=APPROVABLE_STATUSES,
@@ -2073,10 +2384,8 @@ class AdhocTelegramBot:
                 f"Cannot publish from status {current.status if current else 'missing'}."
             )
 
-        image_path = Path(survey.image_path or "")
         caption = group_schedule_caption(survey.year, survey.month, survey.calendar_type)
         try:
-            group_chat_id, topic_id = self.telegram_destination()
             sent_message = self.telegram.send_photo(
                 chat_id=group_chat_id,
                 message_thread_id=topic_id,
@@ -2106,6 +2415,8 @@ class AdhocTelegramBot:
 
         survey = self.repo.get_survey(survey.id) or survey
         self.finalize_published_survey(survey)
+        survey = self.repo.get_survey(survey.id) or survey
+        self.notify_members_schedule_published(survey)
         return pin_error
 
     def canceled_message(self, year: int, month: int, calendar_type: str) -> str:
@@ -2187,13 +2498,15 @@ class AdhocTelegramBot:
             return
 
         work_date = now.date().isoformat()
-        # Claim before send so retries/restarts cannot duplicate the reminder.
-        if not self.repo.claim_daily_reminder(work_date):
+        # Prefer a possible rare duplicate over a silent lost reminder:
+        # mark sent only after Telegram accepts the send. A crash between a
+        # successful send and this mark can duplicate once on retry; claiming
+        # before send would drop the day entirely after a crash.
+        if self.repo.daily_was_sent(work_date):
             return
 
         entry = self.repo.get_schedule_entry(work_date)
         if entry is None:
-            self.repo.clear_daily_reminder(work_date)
             return
 
         main_name, backup_name = entry
@@ -2207,23 +2520,19 @@ class AdhocTelegramBot:
             group_chat_id, topic_id = self.telegram_destination()
         except RuntimeError as exc:
             logger.warning("Daily reminder skipped: %s", exc)
-            self.repo.clear_daily_reminder(work_date)
             return
 
-        try:
-            self.telegram.send_message(
-                chat_id=group_chat_id,
-                message_thread_id=topic_id,
-                text=(
-                    f"Good morning {main_text}.\n"
-                    "Today is your bug day.\n\n"
-                    f"{backup_text} is your backup.\n"
-                    "Have a good day."
-                ),
-            )
-        except TelegramApiError:
-            self.repo.clear_daily_reminder(work_date)
-            raise
+        self.telegram.send_message(
+            chat_id=group_chat_id,
+            message_thread_id=topic_id,
+            text=(
+                f"Good morning {main_text}.\n"
+                "Today is your bug day.\n\n"
+                f"{backup_text} is your backup.\n"
+                "Have a good day."
+            ),
+        )
+        self.repo.mark_daily_sent(work_date)
 
     def resume_collecting_form_delivery(self) -> None:
         for kind in (SURVEY_KIND_PRODUCTION, SURVEY_KIND_DEBUG):
@@ -2282,7 +2591,7 @@ class AdhocTelegramBot:
         for task in (
             lambda now=now: self.ensure_survey_started(now),
             self.resume_collecting_form_delivery,
-            lambda today=today: self.ensure_month_started_preview(today),
+            lambda today=today: self.maybe_activate_due_live_schedule(today),
             lambda now=now: self.maybe_create_preview(now),
             self.send_daily_reminder,
         ):
@@ -2300,6 +2609,7 @@ class AdhocTelegramBot:
         return False
 
     def run_loop_once(self, offset: int | None) -> int | None:
+        poll_started = time.monotonic()
         try:
             updates = self.telegram.get_updates(
                 offset=offset,
@@ -2308,14 +2618,62 @@ class AdhocTelegramBot:
         except TelegramApiError:
             logger.exception("Fetching Telegram updates failed")
             return offset
+        first_update = updates[0] if updates else {}
+        last_update = updates[-1] if updates else {}
+        first_date, first_source = update_telegram_date(first_update)
+        last_date, last_source = update_telegram_date(last_update)
+        first_age = update_age_seconds(first_update) if updates else None
+        last_age = update_age_seconds(last_update) if updates else None
+        logger.debug(
+            "poll cycle offset=%s updates=%s elapsed_ms=%.1f "
+            "first_update_id=%s last_update_id=%s "
+            "first_age_seconds=%s first_age_source=%s first_telegram_date_utc=%s "
+            "last_age_seconds=%s last_age_source=%s last_telegram_date_utc=%s",
+            offset,
+            len(updates),
+            (time.monotonic() - poll_started) * 1000,
+            first_update.get("update_id"),
+            last_update.get("update_id"),
+            f"{first_age:.3f}" if first_age is not None else "unknown",
+            first_source,
+            epoch_utc_label(first_date),
+            f"{last_age:.3f}" if last_age is not None else "unknown",
+            last_source,
+            epoch_utc_label(last_date),
+        )
 
         for update in updates:
             update_id = update.get("update_id")
             next_offset = update_id + 1 if isinstance(update_id, int) else offset
+            kind = update_kind(update)
+            age = update_age_seconds(update)
+            raw_date, age_source = update_telegram_date(update)
+            local_now = datetime.now(timezone.utc)
+            handle_started = time.monotonic()
+            logger.debug(
+                "update handle start update_id=%s kind=%s age_seconds=%s "
+                "age_source=%s telegram_date_epoch=%s telegram_date_utc=%s "
+                "local_now_epoch=%.3f local_now_utc=%s",
+                update_id,
+                kind,
+                f"{age:.3f}" if age is not None else "unknown",
+                age_source,
+                f"{raw_date:.3f}" if raw_date is not None else "unknown",
+                epoch_utc_label(raw_date),
+                local_now.timestamp(),
+                local_now.isoformat(),
+            )
             try:
                 self.handle_update(update)
             except Exception:
                 logger.exception("Handling Telegram update failed: %s", update)
+            finally:
+                logger.debug(
+                    "update handle done update_id=%s kind=%s elapsed_ms=%.1f",
+                    update_id,
+                    kind,
+                    (time.monotonic() - handle_started) * 1000,
+                )
             if next_offset is not None:
                 offset = next_offset
                 self.repo.set_update_offset(offset)
@@ -2328,7 +2686,7 @@ class AdhocTelegramBot:
     def run_forever(self) -> None:
         logger.warning(
             "Starting long-polling bot. Do not run another process with the same "
-            "Telegram bot token (including timed/debug profiles); getUpdates conflicts."
+            "Telegram bot token (including debug or extra bot processes); getUpdates conflicts."
         )
         offset = self.repo.get_update_offset()
         while True:
@@ -2477,6 +2835,8 @@ def local_datetime_value(raw_value: str, timezone_name: str) -> str:
 
 
 def activate_survey_schedule(repo: BotRepository, settings: InfraSettings, survey: Survey) -> None:
+    if survey.status == STATUS_CANCELED:
+        raise SystemExit(f"Cannot activate canceled survey {survey.id} as the live schedule.")
     if not survey.schedule_json:
         raise SystemExit(f"Survey {survey.id} has no schedule_json to activate.")
     schedule = json.loads(survey.schedule_json)
@@ -2533,12 +2893,13 @@ def create_local_survey(
         if closes_raw
         else None
     )
-    kind = getattr(args, "survey_kind", SURVEY_KIND_PRODUCTION) or SURVEY_KIND_PRODUCTION
+    kind = resolve_cli_survey_kind(args)
     created_by = "local-cli-debug" if kind == SURVEY_KIND_DEBUG else "local-cli"
     skip_collect = bool(getattr(args, "direct_preview", False) or getattr(args, "publish_now", False))
     status = STATUS_COLLECTING
     if starts_at > now and not args.send_now and not skip_collect:
         status = STATUS_SCHEDULED
+    replace_active = bool(getattr(args, "replace_active_survey", False))
     return repo.create_survey(
         survey_id=survey_identity(runtime.calendar, year, month),
         calendar_type=runtime.calendar,
@@ -2550,10 +2911,39 @@ def create_local_survey(
         created_by=created_by,
         participants=resolve_local_survey_participants(repo, args),
         kind=kind,
+        replace_active=replace_active,
     )
 
 
 def handle_user_admin_command(repo: BotRepository, args: argparse.Namespace) -> bool:
+    requested_user_actions = [
+        name
+        for name, value in (
+            ("--upsert-user", args.upsert_user),
+            ("--deactivate-user", args.deactivate_user),
+            ("--delete-user", args.delete_user),
+        )
+        if value
+    ]
+    if len(requested_user_actions) > 1:
+        raise SystemExit(
+            "Use only one user command at a time: " + ", ".join(requested_user_actions)
+        )
+
+    if args.deactivate_user:
+        username = normalize_username(args.deactivate_user)
+        if not repo.deactivate_user(username):
+            raise SystemExit(f"User not found: @{username}")
+        print(f"User deactivated: @{username}")
+        return True
+
+    if args.delete_user:
+        username = normalize_username(args.delete_user)
+        if not repo.delete_user(username):
+            raise SystemExit(f"User not found: @{username}")
+        print(f"User deleted: @{username}")
+        return True
+
     if args.upsert_user:
         display_name = args.user_display_name or normalize_username(args.upsert_user)
         participates_in_schedule = None
@@ -2595,11 +2985,11 @@ def handle_user_admin_command(repo: BotRepository, args: argparse.Namespace) -> 
     return False
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Adhoc Assistant Telegram bot.")
     parser.add_argument(
         "--database",
-        help="SQLite database path (infra only). Overrides DATABASE_URL / SQLITE_PATH.",
+        help="SQLite database path (infra only). Overrides DATABASE_URL.",
     )
     parser.add_argument(
         "--survey-start-at",
@@ -2643,6 +3033,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--upsert-user",
         help="Create or update an allowed Telegram username in the bot database, then exit.",
+    )
+    parser.add_argument(
+        "--deactivate-user",
+        help="Mark an allowed Telegram username inactive in bot_users, then exit.",
+    )
+    parser.add_argument(
+        "--delete-user",
+        help=(
+            "Delete an allowed Telegram username from bot_users, then exit. "
+            "Survey snapshots and schedule history are not modified."
+        ),
     )
     parser.add_argument(
         "--user-display-name",
@@ -2690,10 +3091,22 @@ def parse_args() -> argparse.Namespace:
         help="Create a survey from DB roster or --participants, then exit unless --send-now.",
     )
     parser.add_argument(
+        "--replace-active-survey",
+        action="store_true",
+        help=(
+            "With --create-survey / --send-now / --direct-preview / --publish-now: "
+            "cancel any non-terminal survey of the same kind, then create the new one. "
+            "Without this flag, an active survey is a hard conflict."
+        ),
+    )
+    parser.add_argument(
         "--survey-kind",
         choices=[SURVEY_KIND_PRODUCTION, SURVEY_KIND_DEBUG],
-        default=SURVEY_KIND_PRODUCTION,
-        help="Survey kind for --create-survey. Default: production.",
+        default=None,
+        help=(
+            "Survey kind. Defaults to debug for --direct-preview/--publish-now, "
+            "and to production for --create-survey and other create paths."
+        ),
     )
     parser.add_argument(
         "--participants",
@@ -2708,14 +3121,18 @@ def parse_args() -> argparse.Namespace:
         "--direct-preview",
         action="store_true",
         help=(
-            "Create a survey (default kind=debug unless overridden), build preview "
-            "immediately with default availability (no response wait), then exit."
+            "Create a survey (defaults to --survey-kind debug unless explicitly set), "
+            "build preview immediately with default availability (no response wait), then exit."
         ),
     )
     parser.add_argument(
         "--publish-now",
         action="store_true",
-        help="With --direct-preview, also post/approve to the configured Telegram group.",
+        help=(
+            "Create/build a survey preview and publish it (defaults to --survey-kind debug "
+            "unless explicitly set). Debug publish to the production destination still "
+            "requires --allow-production-destination."
+        ),
     )
     parser.add_argument(
         "--allow-production-destination",
@@ -2745,7 +3162,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--set-survey-status",
-        help="Update status for --survey-id.",
+        choices=CLI_SETTABLE_SURVEY_STATUSES,
+        help=(
+            "Guarded status recovery for --survey-id. Allowed targets: "
+            + ", ".join(CLI_SETTABLE_SURVEY_STATUSES)
+            + ". Only real state-machine transitions are accepted "
+            "(scheduled→collecting, or cancel from a cancelable status). "
+            "Preview/revision/approve/publish require their dedicated flows."
+        ),
     )
     parser.add_argument(
         "--set-survey-starts-at",
@@ -2766,6 +3190,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--activate-survey-id",
         help="Explicitly copy a survey's stored schedule into live schedule_entries/monthly_stats for reminders.",
+    )
+    parser.add_argument(
+        "--finalize-publishing-survey-id",
+        help=(
+            "Manually finalize a survey stuck in publishing after you have verified "
+            "the Telegram group post was actually delivered."
+        ),
     )
     parser.add_argument(
         "--list-surveys",
@@ -2869,6 +3300,13 @@ def parse_args() -> argparse.Namespace:
         help="Store bot Telegram id in DB runtime settings.",
     )
     parser.add_argument(
+        "--set-bot-messages",
+        help=(
+            "Merge JSON object into runtime_settings.bot_messages. "
+            f"Keys: {', '.join(BOT_MESSAGE_KEYS)}."
+        ),
+    )
+    parser.add_argument(
         "--set-telegram-token",
         help="Store Telegram bot token in DB runtime settings.",
     )
@@ -2900,7 +3338,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print DB-backed runtime settings such as Telegram destination.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def print_runtime_settings(repo: BotRepository) -> None:
@@ -2938,17 +3376,21 @@ def print_runtime_settings(repo: BotRepository) -> None:
         "poll_interval_seconds",
         "holidays",
         "allow_production_destination",
+        "bot_messages",
     ):
         if key not in raw:
             if key == "allow_production_destination":
                 print(f"{key}: false")
+                continue
+            if key == "bot_messages":
+                print(f"{key}: <defaults>")
                 continue
             print(f"{key}: <missing>")
             continue
         value = raw[key]
         if key == "telegram_token":
             print(f"{key}: {'***' if value else '<empty>'}")
-        elif key == "holidays":
+        elif key in {"holidays", "bot_messages"}:
             print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         elif key == "allow_production_destination":
             print(f"{key}: {bool(value)}")
@@ -3075,6 +3517,32 @@ def handle_local_db_command(
         print(f"Survey restarted: old={old.id} new={new_survey.id}")
         return True
 
+    if args.finalize_publishing_survey_id:
+        survey = repo.get_survey(args.finalize_publishing_survey_id)
+        if survey is None:
+            raise SystemExit(f"Survey not found: {args.finalize_publishing_survey_id}")
+        if survey.status != STATUS_PUBLISHING:
+            raise SystemExit(
+                f"Survey {survey.id} is not in publishing state (status={survey.status})."
+            )
+        if not survey.group_sent_at:
+            repo.update_survey(survey.id, group_sent_at=utc_now())
+            survey = repo.get_survey(survey.id) or survey
+        runtime = repo.get_runtime_settings()
+        today = datetime.now(ZoneInfo(runtime.timezone)).date()
+        activate_live = (
+            survey.kind == SURVEY_KIND_PRODUCTION
+            and current_calendar_month(today, survey.calendar_type) == (survey.year, survey.month)
+        )
+        if not repo.complete_publish(survey.id, activate_live=activate_live):
+            current = repo.get_survey(survey.id)
+            raise SystemExit(
+                f"Failed to finalize publishing survey {survey.id}; "
+                f"status={current.status if current else 'missing'}."
+            )
+        print(f"Publishing survey finalized: {survey.id}")
+        return True
+
     if args.activate_survey_id:
         survey = repo.get_survey(args.activate_survey_id)
         if survey is None:
@@ -3089,16 +3557,46 @@ def handle_local_db_command(
     if args.survey_id and (
         args.set_survey_status or args.set_survey_starts_at or args.set_survey_closes_at
     ):
+        survey = repo.get_survey(args.survey_id)
+        if survey is None:
+            raise SystemExit(f"Survey not found: {args.survey_id}")
         runtime = repo.get_runtime_settings()
-        updates = {}
         if args.set_survey_status:
-            updates["status"] = args.set_survey_status
+            new_status = args.set_survey_status
+            allowed_targets = CLI_SURVEY_STATUS_TRANSITIONS.get(survey.status, set())
+            if new_status not in allowed_targets:
+                raise SystemExit(
+                    f"Cannot set survey {survey.id} from {survey.status!r} to {new_status!r}. "
+                    f"Allowed from {survey.status!r}: "
+                    f"{', '.join(sorted(allowed_targets)) or 'none'}. "
+                    "Use --cancel-survey-id / --force-preview / admin approve for real flows."
+                )
+            if new_status == survey.status:
+                print(f"Survey already {new_status}: {survey.id}")
+            elif not repo.transition_survey(
+                survey.id,
+                from_statuses={survey.status},
+                to_status=new_status,
+            ):
+                current = repo.get_survey(survey.id)
+                raise SystemExit(
+                    f"Could not update survey {survey.id}; "
+                    f"status={current.status if current else 'missing'}"
+                )
+            else:
+                if new_status != STATUS_REVISION_REQUESTED:
+                    repo.clear_revision_allowlist(survey.kind)
+                print(f"Survey status set: {survey.id} {survey.status} -> {new_status}")
         if args.set_survey_starts_at:
-            updates["starts_at"] = local_datetime_value(args.set_survey_starts_at, runtime.timezone)
+            repo.update_survey(
+                args.survey_id,
+                starts_at=local_datetime_value(args.set_survey_starts_at, runtime.timezone),
+            )
         if args.set_survey_closes_at:
-            updates["closes_at"] = local_datetime_value(args.set_survey_closes_at, runtime.timezone)
-        repo.update_survey(args.survey_id, **updates)
-        print(f"Survey updated: {args.survey_id}")
+            closes_at = local_datetime_value(args.set_survey_closes_at, runtime.timezone)
+            repo.update_survey(args.survey_id, closes_at=closes_at)
+        if args.set_survey_starts_at or args.set_survey_closes_at:
+            print(f"Survey updated: {args.survey_id}")
         return True
 
     if args.set_schedule_entry_date:
@@ -3178,6 +3676,27 @@ def handle_local_db_command(
         runtime_updates["telegram_token"] = args.set_telegram_token
     if args.set_output_dir is not None:
         runtime_updates["output_dir"] = args.set_output_dir
+    if getattr(args, "set_bot_messages", None) is not None:
+        try:
+            payload = json.loads(args.set_bot_messages)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid --set-bot-messages JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise SystemExit("--set-bot-messages must be a JSON object.")
+        current_messages = repo.get_runtime_settings_raw().get("bot_messages") or {}
+        if not isinstance(current_messages, dict):
+            current_messages = {}
+        unknown = sorted(set(payload) - set(BOT_MESSAGE_KEYS))
+        if unknown:
+            raise SystemExit(
+                "Unknown bot_messages keys: "
+                + ", ".join(unknown)
+                + f". Allowed: {', '.join(BOT_MESSAGE_KEYS)}"
+            )
+        for key in BOT_MESSAGE_KEYS:
+            if key in payload:
+                current_messages[key] = str(payload[key])
+        runtime_updates["bot_messages"] = current_messages
     if args.set_holidays is not None:
         try:
             holidays = json.loads(args.set_holidays)
@@ -3215,16 +3734,17 @@ def build_bot(settings: InfraSettings, repo: BotRepository) -> AdhocTelegramBot:
     runtime = repo.get_runtime_settings()
     if not runtime.telegram_token:
         raise SystemExit("telegram_token is empty in runtime_settings. Use --set-telegram-token.")
+    try:
+        ensure_jpg_export_support()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     members = repo.list_members(active_only=True)
     telegram = TelegramClient(runtime.telegram_token)
     return AdhocTelegramBot(settings, members, repo, telegram)
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging_from_env()
     args = parse_args()
     settings = load_infra_settings(cli_database=args.database)
     repo = BotRepository(settings.database_path)
@@ -3234,11 +3754,8 @@ def main() -> None:
         return
 
     if args.direct_preview or args.publish_now:
-        if args.survey_kind == SURVEY_KIND_PRODUCTION and not args.create_survey:
-            # Keep explicit production if user set --survey-kind production.
-            pass
-        elif args.survey_kind != SURVEY_KIND_DEBUG:
-            args.survey_kind = SURVEY_KIND_DEBUG
+        # resolve_cli_survey_kind defaults these flows to debug unless --survey-kind
+        # was set explicitly (including production).
         bot = build_bot(settings, repo)
         if args.survey_id and not args.create_survey:
             survey = repo.get_survey(args.survey_id)

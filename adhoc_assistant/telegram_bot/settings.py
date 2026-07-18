@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from adhoc_assistant.constants import DEFAULT_DB_PATH
+from adhoc_assistant.telegram_bot.messages import BotMessages
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,9 @@ class RuntimeSettings:
     output_dir: str
     holidays: list
     allow_production_destination: bool = False
+    bot_messages: BotMessages = field(
+        default_factory=lambda: BotMessages.resolve(None, "gregorian")
+    )
 
     def as_dict(self) -> dict:
         return {
@@ -82,6 +86,7 @@ class RuntimeSettings:
             "output_dir": self.output_dir,
             "holidays": list(self.holidays),
             "allow_production_destination": bool(self.allow_production_destination),
+            "bot_messages": self.bot_messages.as_dict(),
         }
 
     @staticmethod
@@ -111,9 +116,13 @@ class RuntimeSettings:
             holidays = []
         if not isinstance(holidays, list):
             raise RuntimeError("runtime_settings.holidays must be a JSON list.")
+        calendar = str(raw["calendar"])
+        bot_messages_raw = raw.get("bot_messages")
+        if bot_messages_raw is not None and not isinstance(bot_messages_raw, dict):
+            raise RuntimeError("runtime_settings.bot_messages must be a JSON object.")
         return cls(
             timezone=str(raw["timezone"]),
-            calendar=str(raw["calendar"]),
+            calendar=calendar,
             survey_days_before_month=int(raw["survey_days_before_month"]),
             survey_start_at=str(raw["survey_start_at"]).strip(),
             survey_collect_for=str(raw["survey_collect_for"]).strip(),
@@ -129,6 +138,7 @@ class RuntimeSettings:
             output_dir=str(raw["output_dir"]).strip(),
             holidays=list(holidays),
             allow_production_destination=bool(raw.get("allow_production_destination", False)),
+            bot_messages=BotMessages.resolve(bot_messages_raw, calendar),
         )
 
 
@@ -156,7 +166,7 @@ def load_env_file(path: Path) -> None:
 
 
 def resolve_database_path(*, cli_path: str | None = None) -> Path:
-    """Resolve local SQLite path from CLI, DATABASE_URL, SQLITE_PATH, or project root.
+    """Resolve the SQLite path from CLI, DATABASE_URL, or the project-root default.
 
     Only ``sqlite:///`` / ``sqlite://`` DATABASE_URL values are supported today.
     PostgreSQL URLs are rejected explicitly; a Postgres backend is not implemented.
@@ -175,16 +185,12 @@ def resolve_database_path(*, cli_path: str | None = None) -> Path:
             raise RuntimeError(
                 "DATABASE_URL postgres/postgresql is not supported yet; "
                 "the Telegram bot storage layer is SQLite-only. "
-                "Use sqlite:///path/to.db, SQLITE_PATH, or --database."
+                "Use sqlite:///path/to.db or --database."
             )
         raise RuntimeError(
             f"Unsupported DATABASE_URL scheme: {parsed.scheme or '(empty)'}. "
             "Supported today: sqlite:/// for local SQLite only."
         )
-
-    sqlite_path = os.environ.get("SQLITE_PATH", "").strip()
-    if sqlite_path:
-        return Path(sqlite_path)
 
     return Path(DEFAULT_DB_PATH)
 

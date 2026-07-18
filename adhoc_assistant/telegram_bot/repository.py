@@ -90,6 +90,34 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_iso_datetime(raw: str | None) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    value = datetime.fromisoformat(text)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def survey_counts_as_active(survey: Survey, *, now: datetime | None = None) -> bool:
+    if survey.status == "canceled":
+        return False
+    if survey.status != "approved":
+        return True
+    if not survey.group_sent_at:
+        return False
+    closes_at = parse_iso_datetime(survey.closes_at)
+    if closes_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    return current < closes_at
+
+
 def stable_participant_id(member: Member) -> int:
     """Stable survey/response identity. Real Telegram IDs stay positive."""
     telegram_id = int(member.telegram_id or 0)
@@ -112,6 +140,16 @@ def schedule_person_key(member: Member) -> str:
     if username:
         return username
     return member.name.strip()
+
+
+def display_name_or_username(display_name: str, username: str) -> str:
+    display_name = str(display_name or "").strip()
+    if display_name:
+        return display_name
+    username = normalize_username(username)
+    if username:
+        return username
+    return ""
 
 
 class BotRepository:
@@ -709,10 +747,14 @@ class BotRepository:
             self.delete_state("active_survey")
 
     def active_survey_conflict_message(self, active: Survey, kind: str) -> str:
+        status = active.status
+        if status == "approved" and active.closes_at:
+            status = f"approved until {active.closes_at}"
         return (
             f"Cannot create a new {kind} survey; survey {active.id} "
             f"({active.calendar_type} {active.year}-{active.month:02d}) "
-            f"is still {active.status}. Cancel or deactivate it first."
+            f"is still {status}. Pass replace_active=True / "
+            f"--replace-active-survey to cancel it and start a new one."
         )
 
     def create_survey(
@@ -728,7 +770,16 @@ class BotRepository:
         created_by: str,
         participants: list[Member],
         kind: str = SURVEY_KIND_PRODUCTION,
+        replace_active: bool = False,
     ) -> Survey:
+        """Create a survey.
+
+        At most one still-active survey per kind. Approved surveys remain
+        active until their closes_at window ends, unless canceled manually.
+        Without replace_active, an existing active survey of the same kind is a
+        hard conflict. With replace_active, every still-active survey of that
+        kind is canceled in the same transaction before the new row is inserted.
+        """
         kind = self.normalize_survey_kind(kind)
         self.migrate_legacy_active_survey_state()
         normalized_participants: list[tuple] = []
@@ -757,25 +808,37 @@ class BotRepository:
             )
 
         now = utc_now()
+        replaced_ids: list[str] = []
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            active_state = conn.execute(
-                "SELECT value FROM bot_state WHERE key = ?",
-                (active_survey_id_state_key(kind),),
-            ).fetchone()
-            if active_state:
-                payload = json.loads(active_state[0])
-                active_id = payload.get("id")
-                if active_id:
-                    row = conn.execute(
-                        "SELECT status FROM surveys WHERE id = ?",
-                        (active_id,),
-                    ).fetchone()
-                    if row and row[0] not in TERMINAL_SURVEY_STATUSES:
-                        raise ValueError(
-                            f"Cannot create a new {kind} survey; survey {active_id} "
-                            f"is still {row[0]}. Cancel or deactivate it first."
-                        )
+            active_rows = conn.execute(
+                f"""
+                SELECT {SURVEY_SELECT_COLUMNS}
+                FROM surveys
+                WHERE kind = ?
+                  AND status != 'canceled'
+                ORDER BY created_at DESC
+                """
+            , (kind,)).fetchall()
+            active_conflicts = [
+                self.survey_row_to_dataclass(row)
+                for row in active_rows
+                if survey_counts_as_active(self.survey_row_to_dataclass(row))
+            ]
+            if active_conflicts:
+                if not replace_active:
+                    active = active_conflicts[0]
+                    raise ValueError(self.active_survey_conflict_message(active, kind))
+                for active in active_conflicts:
+                    conn.execute(
+                        """
+                        UPDATE surveys
+                        SET status = ?, updated_at = ?
+                        WHERE id = ? AND status != 'canceled'
+                        """,
+                        ("canceled", now, active.id),
+                    )
+                    replaced_ids.append(active.id)
             conn.execute(
                 """
                 INSERT INTO surveys (
@@ -827,7 +890,40 @@ class BotRepository:
                 """,
                 normalized_participants,
             )
-        self.set_active_survey_id(survey_id, kind)
+            # Active pointer is owned by surveys; keep it in the same txn.
+            conn.execute(
+                """
+                INSERT INTO bot_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (active_survey_id_state_key(kind), json.dumps({"id": survey_id})),
+            )
+            if status in TERMINAL_SURVEY_STATUSES:
+                conn.execute(
+                    "DELETE FROM bot_state WHERE key IN (?, ?)",
+                    (active_survey_id_state_key(kind), active_survey_phase_state_key(kind)),
+                )
+        if replaced_ids:
+            for old_id in replaced_ids:
+                if kind == SURVEY_KIND_PRODUCTION:
+                    old = self.get_survey(old_id)
+                    if old is not None:
+                        self.upsert_monthly_run(
+                            old.calendar_type,
+                            old.year,
+                            old.month,
+                            old.status,
+                            survey_id=old.id,
+                            requested_at=old.requested_at,
+                            preview_sent_at=old.preview_sent_at,
+                            approved_at=old.approved_at,
+                            group_sent_at=old.group_sent_at,
+                            image_path=old.image_path,
+                            schedule_json=old.schedule_json,
+                            stats_json=old.stats_json,
+                            review_json=old.review_json,
+                        )
         if kind == SURVEY_KIND_PRODUCTION:
             self.upsert_monthly_run(
                 calendar_type,
@@ -840,7 +936,7 @@ class BotRepository:
         survey = self.get_survey(survey_id)
         if survey is None:
             raise RuntimeError(f"Survey {survey_id} was not created.")
-        self.set_active_survey_phase(survey)
+        self.clear_revision_allowlist(kind)
         return survey
 
     def survey_row_to_dataclass(self, row: sqlite3.Row | tuple) -> Survey:
@@ -880,31 +976,21 @@ class BotRepository:
         return self.survey_row_to_dataclass(row) if row else None
 
     def get_active_survey(self, kind: str = SURVEY_KIND_PRODUCTION) -> Survey | None:
+        """Return the survey pointed at by active_survey_id:{kind}.
+
+        The pointer is the only source of truth for "active". Orphan
+        non-terminal rows are not revived; clear a stale pointer instead.
+        """
         kind = self.normalize_survey_kind(kind)
         self.migrate_legacy_active_survey_state()
         state = self.get_state(active_survey_id_state_key(kind))
-        if state and state.get("id"):
-            survey = self.get_survey(str(state["id"]))
-            if survey is not None and survey.status not in TERMINAL_SURVEY_STATUSES:
-                return survey
-            self.clear_active_survey_id(kind)
-
-        with self.connect() as conn:
-            row = conn.execute(
-                f"""
-                SELECT {SURVEY_SELECT_COLUMNS}
-                FROM surveys
-                WHERE status NOT IN ('approved', 'canceled')
-                  AND kind = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (kind,),
-            ).fetchone()
-        if row is None:
+        if not state or not state.get("id"):
             return None
-        survey = self.survey_row_to_dataclass(row)
-        self.set_active_survey_id(survey.id, kind)
+        survey = self.get_survey(str(state["id"]))
+        if survey is None or not survey_counts_as_active(survey):
+            self.clear_active_survey_id(kind)
+            self.clear_active_survey_phase(kind)
+            return None
         return survey
 
     def list_non_terminal_surveys(self, kind: str | None = None) -> list[Survey]:
@@ -930,7 +1016,11 @@ class BotRepository:
                     """,
                     (kind,),
                 ).fetchall()
-        return [self.survey_row_to_dataclass(row) for row in rows]
+        return [
+            survey
+            for row in rows
+            if (survey := self.survey_row_to_dataclass(row)) and survey_counts_as_active(survey)
+        ]
 
     def get_latest_survey_for_month(
         self,
@@ -977,29 +1067,35 @@ class BotRepository:
             ).fetchall()
         return [self.survey_row_to_dataclass(row) for row in rows]
 
-    def set_active_survey_phase(self, survey: Survey, **extra) -> None:
-        payload = {
-            "id": survey.id,
-            "kind": survey.kind,
-            "calendar": survey.calendar_type,
-            "year": survey.year,
-            "month": survey.month,
-            "phase": survey.status,
-            "collect_until": survey.closes_at,
-            "allowed_member_ids": [],
-        }
-        payload.update(extra)
-        self.set_state(active_survey_phase_state_key(survey.kind), payload)
-        self.set_active_survey_id(survey.id, survey.kind)
+    def set_revision_allowlist(self, survey: Survey, member_ids: list[int]) -> None:
+        """Store revision targeting allowlist for the active survey of this kind.
 
-    def get_active_survey_phase(self, kind: str = SURVEY_KIND_PRODUCTION) -> dict | None:
-        kind = self.normalize_survey_kind(kind)
-        self.migrate_legacy_active_survey_state()
-        return self.get_state(active_survey_phase_state_key(kind))
+        This is the only business payload kept under active_survey:{kind}.
+        Lifecycle status/deadline live exclusively on the surveys row.
+        """
+        self.set_state(
+            active_survey_phase_state_key(survey.kind),
+            {
+                "id": survey.id,
+                "kind": survey.kind,
+                "allowed_member_ids": sorted({int(item) for item in member_ids}),
+            },
+        )
 
-    def clear_active_survey_phase(self, kind: str) -> None:
+    def get_revision_allowlist(self, survey: Survey) -> list[int]:
+        state = self.get_state(active_survey_phase_state_key(survey.kind))
+        if not state or state.get("id") != survey.id:
+            return []
+        return [int(item) for item in state.get("allowed_member_ids") or []]
+
+    def clear_revision_allowlist(self, kind: str) -> None:
         kind = self.normalize_survey_kind(kind)
         self.delete_state(active_survey_phase_state_key(kind))
+
+    def clear_active_survey_phase(self, kind: str) -> None:
+        """Clear revision allowlist and active survey pointer for kind."""
+        kind = self.normalize_survey_kind(kind)
+        self.clear_revision_allowlist(kind)
         self.clear_active_survey_id(kind)
 
     def update_survey(
@@ -1045,13 +1141,13 @@ class BotRepository:
             )
         updated = self.get_survey(survey_id)
         if updated:
-            if updated.status in TERMINAL_SURVEY_STATUSES:
+            if survey_counts_as_active(updated):
+                self.set_active_survey_id(survey_id, updated.kind)
+            else:
                 state = self.get_state(active_survey_id_state_key(updated.kind))
                 if state and state.get("id") == survey_id:
                     self.clear_active_survey_id(updated.kind)
                     self.clear_active_survey_phase(updated.kind)
-            else:
-                self.set_active_survey_id(survey_id, updated.kind)
             if updated.kind == SURVEY_KIND_PRODUCTION:
                 self.upsert_monthly_run(
                     updated.calendar_type,
@@ -1096,13 +1192,13 @@ class BotRepository:
         if changed:
             updated = self.get_survey(survey_id)
             if updated:
-                if updated.status in TERMINAL_SURVEY_STATUSES:
+                if survey_counts_as_active(updated):
+                    self.set_active_survey_id(survey_id, updated.kind)
+                else:
                     state = self.get_state(active_survey_id_state_key(updated.kind))
                     if state and state.get("id") == survey_id:
                         self.clear_active_survey_id(updated.kind)
                         self.clear_active_survey_phase(updated.kind)
-                else:
-                    self.set_active_survey_id(survey_id, updated.kind)
                 if updated.kind == SURVEY_KIND_PRODUCTION:
                     self.upsert_monthly_run(
                         updated.calendar_type,
@@ -1134,19 +1230,8 @@ class BotRepository:
             return None
         return int(year), int(month)
 
-    def claim_daily_reminder(self, work_date: str) -> bool:
-        """Atomically claim today's reminder. Returns True only for the winning claim."""
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO daily_reminders (work_date, sent_at)
-                VALUES (?, ?)
-                """,
-                (work_date, utc_now()),
-            )
-            return cursor.rowcount == 1
-
     def mark_daily_sent(self, work_date: str) -> None:
+        """Record that today's reminder was delivered successfully."""
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1168,20 +1253,73 @@ class BotRepository:
         with self.connect() as conn:
             conn.execute("DELETE FROM daily_reminders WHERE work_date = ?", (work_date,))
 
-    def complete_publish(self, survey_id: str) -> bool:
+    def has_schedule_month(self, year: int, month: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM schedule_entries
+                WHERE year = ? AND month = ?
+                LIMIT 1
+                """,
+                (year, month),
+            ).fetchone()
+        return row is not None
+
+    def unconfirm_survey_responses(self, survey_id: str, telegram_ids: list[int]) -> None:
+        """Clear confirmed flags so revision members must respond again."""
+        if not telegram_ids:
+            return
+        placeholders = ", ".join("?" for _ in telegram_ids)
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE survey_responses
+                SET confirmed = 0, updated_at = ?
+                WHERE survey_id = ? AND telegram_id IN ({placeholders})
+                """,
+                (utc_now(), survey_id, *telegram_ids),
+            )
+
+    def complete_publish(self, survey_id: str, *, activate_live: bool = False) -> bool:
+        """Finalize a publishing survey.
+
+        Production surveys always write schedule_entries/monthly_stats for their
+        year/month. active_schedule_source (live reminders) switches only when
+        activate_live is True — callers must not activate a future month early.
+
+        Any failure raises so the connection context rolls back; never leave
+        schedule writes committed while the survey stays in publishing.
+        """
         survey = self.get_survey(survey_id)
         if survey is None or survey.status != "publishing":
             return False
 
+        # Validate artifacts before opening the write transaction.
         if survey.kind == SURVEY_KIND_PRODUCTION:
             schedule = json.loads(survey.schedule_json or "[]")
             plain_stats = stats_to_plain_dict(json.loads(survey.stats_json or "{}"))
+            if not isinstance(schedule, list):
+                raise ValueError(f"Survey {survey.id} schedule_json must be a list.")
         else:
             schedule = []
             plain_stats = {}
 
         now = utc_now()
         with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE surveys
+                SET status = ?, approved_at = ?, group_sent_at = COALESCE(group_sent_at, ?), updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                ("approved", now, now, now, survey.id, "publishing"),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Failed to approve survey {survey.id} from publishing "
+                    "(status changed concurrently)."
+                )
+
             if survey.kind == SURVEY_KIND_PRODUCTION:
                 conn.execute(
                     "DELETE FROM monthly_stats WHERE year = ? AND month = ?",
@@ -1243,36 +1381,64 @@ class BotRepository:
                         for item in schedule
                     ],
                 )
+                if activate_live:
+                    conn.execute(
+                        """
+                        INSERT INTO bot_state (key, value)
+                        VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (
+                            ACTIVE_SCHEDULE_SOURCE_KEY,
+                            json.dumps(
+                                {"year": int(survey.year), "month": int(survey.month)}
+                            ),
+                        ),
+                    )
+
+            if survey_counts_as_active(
+                Survey(
+                    id=survey.id,
+                    calendar_type=survey.calendar_type,
+                    year=survey.year,
+                    month=survey.month,
+                    status="approved",
+                    starts_at=survey.starts_at,
+                    closes_at=survey.closes_at,
+                    created_by=survey.created_by,
+                    requested_at=survey.requested_at,
+                    preview_sent_at=survey.preview_sent_at,
+                    approved_at=now,
+                    group_sent_at=survey.group_sent_at or now,
+                    image_path=survey.image_path,
+                    schedule_json=survey.schedule_json,
+                    stats_json=survey.stats_json,
+                    review_json=survey.review_json,
+                    created_at=survey.created_at,
+                    updated_at=now,
+                    kind=survey.kind,
+                )
+            ):
                 conn.execute(
                     """
                     INSERT INTO bot_state (key, value)
                     VALUES (?, ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
+                    (active_survey_id_state_key(survey.kind), json.dumps({"id": survey.id})),
+                )
+                conn.execute(
+                    "DELETE FROM bot_state WHERE key = ?",
+                    (active_survey_phase_state_key(survey.kind),),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM bot_state WHERE key IN (?, ?)",
                     (
-                        ACTIVE_SCHEDULE_SOURCE_KEY,
-                        json.dumps({"year": int(survey.year), "month": int(survey.month)}),
+                        active_survey_id_state_key(survey.kind),
+                        active_survey_phase_state_key(survey.kind),
                     ),
                 )
-
-            cursor = conn.execute(
-                """
-                UPDATE surveys
-                SET status = ?, approved_at = ?, group_sent_at = COALESCE(group_sent_at, ?), updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                ("approved", now, now, now, survey.id, "publishing"),
-            )
-            if cursor.rowcount != 1:
-                return False
-
-            conn.execute(
-                "DELETE FROM bot_state WHERE key IN (?, ?)",
-                (
-                    active_survey_id_state_key(survey.kind),
-                    active_survey_phase_state_key(survey.kind),
-                ),
-            )
 
         updated = self.get_survey(survey.id)
         if updated and updated.kind == SURVEY_KIND_PRODUCTION:
@@ -1294,30 +1460,25 @@ class BotRepository:
         return True
 
     def get_schedule_entry(self, work_date: str) -> tuple[str, str] | None:
+        """Read today's main/backup from the live schedule source only.
+
+        Without active_schedule_source there is no live reminder schedule —
+        never fall back to "latest year/month" ordering (that conflates months).
+        """
         source = self.get_active_schedule_source()
+        if source is None:
+            return None
+        year, month = source
         with self.connect() as conn:
-            if source is not None:
-                year, month = source
-                row = conn.execute(
-                    """
-                    SELECT main, backup
-                    FROM schedule_entries
-                    WHERE work_date = ? AND year = ? AND month = ?
-                    LIMIT 1
-                    """,
-                    (work_date, year, month),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    SELECT main, backup
-                    FROM schedule_entries
-                    WHERE work_date = ?
-                    ORDER BY year DESC, month DESC
-                    LIMIT 1
-                    """,
-                    (work_date,),
-                ).fetchone()
+            row = conn.execute(
+                """
+                SELECT main, backup
+                FROM schedule_entries
+                WHERE work_date = ? AND year = ? AND month = ?
+                LIMIT 1
+                """,
+                (work_date, year, month),
+            ).fetchone()
         return (row[0], row[1]) if row else None
 
     def list_survey_participants(self, survey_id: str) -> list[Member]:
@@ -1517,14 +1678,18 @@ class BotRepository:
         main: str,
         backup: str,
     ) -> bool:
+        source = self.get_active_schedule_source()
         with self.connect() as conn:
+            if source is None:
+                return False
+            year, month = source
             cursor = conn.execute(
                 """
                 UPDATE schedule_entries
                 SET main = ?, backup = ?
-                WHERE work_date = ?
+                WHERE work_date = ? AND year = ? AND month = ?
                 """,
-                (main, backup, work_date),
+                (main, backup, work_date, year, month),
             )
         return cursor.rowcount == 1
 
@@ -1546,6 +1711,7 @@ class BotRepository:
             raise ValueError("username is required")
         if access_level not in {"member", "admin"}:
             raise ValueError("access_level must be 'member' or 'admin'")
+        display_name = display_name_or_username(display_name, username)
 
         existing = self.get_user_by_username(username) or {}
         now = utc_now()
@@ -1659,19 +1825,65 @@ class BotRepository:
             ).fetchone()
         return self.user_row_to_dict(row) if row else None
 
+    def deactivate_user(self, username: str) -> bool:
+        username = normalize_username(username)
+        if not username:
+            raise ValueError("username is required")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE bot_users
+                SET active = 0, updated_at = ?
+                WHERE username = ?
+                """,
+                (utc_now(), username),
+            )
+        return cursor.rowcount == 1
+
+    def delete_user(self, username: str) -> bool:
+        username = normalize_username(username)
+        if not username:
+            raise ValueError("username is required")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM bot_users WHERE username = ?",
+                (username,),
+            )
+        return cursor.rowcount == 1
+
     def authorize_user_from_start(
         self,
         username: str,
         telegram_id: int,
         display_name: str = "",
     ) -> dict | None:
+        """Bind a Telegram id to an allowlisted username once.
+
+        Username is only an invite key for the first bind. Rebinding an already
+        owned telegram_id (or claiming a username already bound to another id)
+        is rejected — username alone must not transfer privileged identity.
+        """
         username = normalize_username(username)
+        telegram_id = int(telegram_id)
+        if telegram_id <= 0:
+            return None
         user = self.get_user_by_username(username)
         if user is None or not user["active"]:
             return None
 
+        existing_bound_id = user.get("telegram_id")
+        if existing_bound_id is not None and int(existing_bound_id) != telegram_id:
+            return None
+
+        other = self.get_user_by_telegram_id(telegram_id)
+        if other is not None and normalize_username(other["username"]) != username:
+            return None
+
         now = utc_now()
-        display_name = display_name.strip() or user["display_name"]
+        display_name = display_name_or_username(
+            display_name,
+            username,
+        ) or display_name_or_username(user["display_name"], user["username"])
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1682,10 +1894,88 @@ class BotRepository:
                     last_seen_at = ?,
                     updated_at = ?
                 WHERE username = ?
+                  AND (telegram_id IS NULL OR telegram_id = ?)
                 """,
-                (telegram_id, display_name, now, now, now, username),
+                (telegram_id, display_name, now, now, now, username, telegram_id),
             )
-        return self.get_user_by_username(username)
+        self.rebind_open_survey_identity(username, telegram_id)
+        return self.get_user_by_telegram_id(telegram_id)
+
+    def rebind_open_survey_identity(self, username: str, telegram_id: int) -> None:
+        """Move open-survey roster/response rows onto a newly bound Telegram id.
+
+        Pre-registered users may join surveys before first /start, using a
+        stable synthetic participant id. After bind, those rows must follow.
+        """
+        username = normalize_username(username)
+        telegram_id = int(telegram_id)
+        if not username or telegram_id <= 0:
+            return
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT sp.survey_id, sp.telegram_id
+                FROM survey_participants sp
+                JOIN surveys s ON s.id = sp.survey_id
+                WHERE sp.username = ?
+                  AND sp.telegram_id != ?
+                  AND s.status NOT IN ('approved', 'canceled')
+                """,
+                (username, telegram_id),
+            ).fetchall()
+            for survey_id, old_id in rows:
+                old_id = int(old_id)
+                already = conn.execute(
+                    """
+                    SELECT 1 FROM survey_participants
+                    WHERE survey_id = ? AND telegram_id = ?
+                    """,
+                    (survey_id, telegram_id),
+                ).fetchone()
+                if already:
+                    conn.execute(
+                        """
+                        DELETE FROM survey_participants
+                        WHERE survey_id = ? AND telegram_id = ?
+                        """,
+                        (survey_id, old_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE survey_participants
+                        SET telegram_id = ?
+                        WHERE survey_id = ? AND telegram_id = ?
+                        """,
+                        (telegram_id, survey_id, old_id),
+                    )
+
+                for table in ("survey_responses", "survey_messages"):
+                    target = conn.execute(
+                        f"""
+                        SELECT 1 FROM {table}
+                        WHERE survey_id = ? AND telegram_id = ?
+                        """,
+                        (survey_id, telegram_id),
+                    ).fetchone()
+                    if target:
+                        conn.execute(
+                            f"""
+                            DELETE FROM {table}
+                            WHERE survey_id = ? AND telegram_id = ?
+                            """,
+                            (survey_id, old_id),
+                        )
+                    else:
+                        conn.execute(
+                            f"""
+                            UPDATE {table}
+                            SET telegram_id = ?
+                            WHERE survey_id = ? AND telegram_id = ?
+                            """,
+                            (telegram_id, survey_id, old_id),
+                        )
 
     def mark_user_seen(
         self,
@@ -1697,7 +1987,10 @@ class BotRepository:
             return None
 
         now = utc_now()
-        display_name = display_name.strip() or user["display_name"]
+        display_name = display_name_or_username(
+            display_name,
+            user["username"],
+        ) or display_name_or_username(user["display_name"], user["username"])
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1764,7 +2057,7 @@ class BotRepository:
     def user_to_member(self, user: dict) -> Member:
         telegram_id = int(user["telegram_id"] or 0)
         member = Member(
-            name=user["display_name"],
+            name=display_name_or_username(user["display_name"], user["username"]),
             telegram_id=telegram_id,
             username=user["username"],
             role=user["role"],

@@ -1,10 +1,14 @@
 import json
+import logging
 import mimetypes
 import time
 import urllib.parse
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramApiError(RuntimeError):
@@ -96,6 +100,8 @@ class TelegramClient:
         )
 
     def get_updates(self, offset: int | None, timeout: int = 30) -> list[dict]:
+        started = time.monotonic()
+        logger.debug("telegram.getUpdates start offset=%s timeout=%s", offset, timeout)
         payload = {"timeout": timeout, "allowed_updates": json.dumps(["message", "callback_query"])}
         if offset is not None:
             payload["offset"] = offset
@@ -106,7 +112,15 @@ class TelegramClient:
             data=data,
             timeout=timeout + self.extra_read_timeout_seconds,
         )
-        return response["result"]
+        updates = response["result"]
+        logger.debug(
+            "telegram.getUpdates done offset=%s timeout=%s updates=%s elapsed_ms=%.1f",
+            offset,
+            timeout,
+            len(updates),
+            (time.monotonic() - started) * 1000,
+        )
+        return updates
 
     def send_message(
         self,
@@ -211,6 +225,7 @@ class TelegramClient:
     ) -> dict:
         last_error: TelegramApiError | None = None
         for attempt in range(1, self.max_retries + 1):
+            started = time.monotonic()
             try:
                 with urllib.request.urlopen(request_or_url, data=data, timeout=timeout) as response:
                     payload = json.loads(response.read().decode())
@@ -226,6 +241,13 @@ class TelegramClient:
                     self._sleep_for_retry(error, attempt)
                     last_error = error
                     continue
+                logger.debug(
+                    "telegram.%s failed attempt=%s elapsed_ms=%.1f error=%s",
+                    method,
+                    attempt,
+                    (time.monotonic() - started) * 1000,
+                    error,
+                )
                 raise error from exc
             except urllib.error.URLError as exc:
                 error = TelegramApiError(
@@ -239,12 +261,32 @@ class TelegramClient:
                     self._sleep_for_retry(error, attempt)
                     last_error = error
                     continue
+                logger.debug(
+                    "telegram.%s failed attempt=%s elapsed_ms=%.1f error=%s",
+                    method,
+                    attempt,
+                    (time.monotonic() - started) * 1000,
+                    error,
+                )
                 raise error from exc
 
             error = self._api_error(method, payload)
             if error is None:
+                logger.debug(
+                    "telegram.%s ok attempt=%s elapsed_ms=%.1f",
+                    method,
+                    attempt,
+                    (time.monotonic() - started) * 1000,
+                )
                 return payload
             if error.ignorable:
+                logger.debug(
+                    "telegram.%s ignorable_error attempt=%s elapsed_ms=%.1f error=%s",
+                    method,
+                    attempt,
+                    (time.monotonic() - started) * 1000,
+                    error,
+                )
                 raise error
             if (
                 error.retryable
@@ -254,6 +296,13 @@ class TelegramClient:
                 self._sleep_for_retry(error, attempt)
                 last_error = error
                 continue
+            logger.debug(
+                "telegram.%s failed attempt=%s elapsed_ms=%.1f error=%s",
+                method,
+                attempt,
+                (time.monotonic() - started) * 1000,
+                error,
+            )
             raise error
 
         if last_error is not None:

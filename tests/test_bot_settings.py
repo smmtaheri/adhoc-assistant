@@ -18,15 +18,8 @@ class BotSettingsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DATABASE_URL": "sqlite:///from-url.sqlite3"}, clear=False):
             self.assertEqual(resolve_database_path(), Path("from-url.sqlite3"))
 
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in {"DATABASE_URL", "SQLITE_PATH"}
-        }
+        env = {key: value for key, value in os.environ.items() if key != "DATABASE_URL"}
         with mock.patch.dict(os.environ, env, clear=True):
-            os.environ["SQLITE_PATH"] = "from-sqlite-path.sqlite3"
-            self.assertEqual(resolve_database_path(), Path("from-sqlite-path.sqlite3"))
-            del os.environ["SQLITE_PATH"]
             self.assertEqual(resolve_database_path(), Path(DEFAULT_DB_PATH))
             self.assertEqual(
                 resolve_database_path(cli_path="from-cli.sqlite3"),
@@ -50,21 +43,13 @@ class BotSettingsTests(unittest.TestCase):
                 repo.get_runtime_settings()
             self.assertIn("Incomplete runtime_settings", str(ctx.exception))
 
-    def test_timed_compose_does_not_pass_domain_policy_or_config_files(self) -> None:
+    def test_compose_does_not_define_implicit_timed_database(self) -> None:
         compose = Path("docker-compose.yml").read_text(encoding="utf-8")
         self.assertNotIn("bot_config", compose)
         self.assertNotIn("--config", compose)
-        timed_block = compose.split("adhoc-assistant-timed:")[1].split("adhoc-assistant-cli:")[0]
-        for flag in (
-            "--target-month",
-            "--survey-start-at",
-            "--survey-collect-for",
-            "--revision-collect-for",
-            "TELEGRAM_BOT_TOKEN",
-        ):
-            self.assertNotIn(flag, timed_block)
-        self.assertIn("--database", timed_block)
-        self.assertNotIn("--reset-target-month", timed_block)
+        self.assertNotIn("adhoc-assistant-timed", compose)
+        self.assertNotIn("TIMED_DATABASE_URL", compose)
+        self.assertNotIn("timed_adhoc.sqlite3", compose)
 
     def test_postgres_database_url_is_rejected_clearly(self) -> None:
         with mock.patch.dict(
@@ -83,6 +68,34 @@ class BotSettingsTests(unittest.TestCase):
         self.assertIn("output_dir", missing)
         self.assertIn("bot_name", missing)
         self.assertIn("holidays", missing)
+
+    def test_bot_messages_merge_defaults_from_runtime_settings(self) -> None:
+        settings = RuntimeSettings.from_dict(
+            {
+                "timezone": "Asia/Tehran",
+                "calendar": "gregorian",
+                "survey_days_before_month": 2,
+                "survey_start_at": "",
+                "survey_collect_for": "",
+                "revision_collect_for": "+2h",
+                "target_year": None,
+                "target_month": None,
+                "daily_reminder_time": "09:00",
+                "poll_interval_seconds": 1,
+                "bot_name": "test_bot",
+                "bot_username": "@test_bot",
+                "bot_id": 1,
+                "telegram_token": "TOKEN",
+                "output_dir": "output",
+                "holidays": [],
+                "bot_messages": {"unauthorized": "NOPE"},
+            }
+        )
+        self.assertEqual(settings.bot_messages.unauthorized, "NOPE")
+        self.assertEqual(
+            settings.bot_messages.no_active_survey,
+            "There is no active availability survey right now.",
+        )
 
 
 if __name__ == "__main__":
