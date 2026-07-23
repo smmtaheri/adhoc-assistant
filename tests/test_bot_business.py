@@ -2,6 +2,8 @@ import argparse
 import json
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -19,12 +21,15 @@ from adhoc_assistant.telegram_bot.service import (
     build_schedule_config,
     create_local_survey,
     due_survey_month,
+    format_survey_report,
     handle_user_admin_command,
     handle_local_db_command,
     is_local_only_member,
     mention,
     parse_args,
     parse_scheduled_datetime,
+    PartitionedTelegramUpdateDispatcher,
+    stable_worker_index,
     local_only_member,
     reset_target_month_state,
     resolve_cli_survey_kind,
@@ -191,6 +196,45 @@ def connect_db(path: Path):
         conn.close()
 
 
+def drain_dispatcher(dispatcher: PartitionedTelegramUpdateDispatcher) -> None:
+    for worker_queue in dispatcher.queues:
+        worker_queue.join()
+    dispatcher.advance_offset()
+
+
+class RecordingWorkerBot:
+    def __init__(self, repo: BotRepository, delay: float = 0.0) -> None:
+        self.repo = repo
+        self.delay = delay
+        self.handled = []
+        self.started = []
+        self.lock = threading.Lock()
+
+    def update_partition_key(self, update: dict) -> str:
+        return str(update["partition"])
+
+    def handle_update(self, update: dict) -> None:
+        with self.lock:
+            self.started.append((update["update_id"], time.monotonic()))
+        if self.delay:
+            time.sleep(self.delay)
+        with self.lock:
+            self.handled.append(update["update_id"])
+
+
+class FlakyRecordingWorkerBot(RecordingWorkerBot):
+    def __init__(self, repo: BotRepository, failures_before_success: int) -> None:
+        super().__init__(repo)
+        self.failures_before_success = failures_before_success
+        self.attempts = 0
+
+    def handle_update(self, update: dict) -> None:
+        self.attempts += 1
+        if self.attempts <= self.failures_before_success:
+            raise RuntimeError("temporary failure")
+        super().handle_update(update)
+
+
 def members() -> list[Member]:
     return [
         Member("Ali", 1, "ali_user", "backend", True),
@@ -353,6 +397,238 @@ class TelegramBotBusinessTests(unittest.TestCase):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"fake jpg")
 
+    def test_partition_worker_preserves_order_for_same_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = RecordingWorkerBot(repo)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=2,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            dispatcher.enqueue_update({"update_id": 1, "partition": "availability:S1:1"})
+            dispatcher.enqueue_update({"update_id": 2, "partition": "availability:S1:1"})
+            drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertEqual(bot.handled, [1, 2])
+            self.assertEqual(repo.get_update_offset(), 3)
+
+    def test_different_partitions_can_run_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            key_a = "user:a"
+            key_b = next(
+                f"user:{index}"
+                for index in range(100)
+                if stable_worker_index(f"user:{index}", 2) != stable_worker_index(key_a, 2)
+            )
+            bot = RecordingWorkerBot(repo, delay=0.2)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=2,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            started = time.monotonic()
+            dispatcher.enqueue_update({"update_id": 1, "partition": key_a})
+            dispatcher.enqueue_update({"update_id": 2, "partition": key_b})
+            drain_dispatcher(dispatcher)
+            elapsed = time.monotonic() - started
+            dispatcher.stop(timeout=1)
+
+            self.assertCountEqual(bot.handled, [1, 2])
+            self.assertLess(elapsed, 0.35)
+
+    def test_offset_does_not_skip_lower_incomplete_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            repo.claim_telegram_update(
+                update_id=100,
+                callback_query_id="callback-100",
+                partition_key="user:100",
+                worker_id=0,
+            )
+            repo.mark_telegram_update_enqueued(100)
+            repo.claim_telegram_update(
+                update_id=101,
+                callback_query_id="callback-101",
+                partition_key="user:101",
+                worker_id=1,
+            )
+            repo.mark_telegram_update_enqueued(101)
+            repo.mark_telegram_update_processed(101)
+
+            self.assertEqual(repo.advance_update_offset_from_tracking(None), 100)
+            self.assertEqual(repo.get_update_offset(), 100)
+
+            repo.mark_telegram_update_processed(100)
+            self.assertEqual(repo.advance_update_offset_from_tracking(100), 102)
+
+    def test_offset_advances_across_missing_update_id_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            for update_id in (615, 616, 620):
+                repo.claim_telegram_update(
+                    update_id=update_id,
+                    callback_query_id=None,
+                    partition_key=f"user:{update_id}",
+                    worker_id=0,
+                )
+                repo.mark_telegram_update_processed(update_id)
+
+            self.assertEqual(repo.advance_update_offset_from_tracking(606), 621)
+            self.assertEqual(repo.get_update_offset(), 621)
+
+    def test_duplicate_update_id_is_not_processed_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = RecordingWorkerBot(repo)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=1,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            self.assertTrue(dispatcher.enqueue_update({"update_id": 1, "partition": "user:1"}))
+            self.assertFalse(dispatcher.enqueue_update({"update_id": 1, "partition": "user:1"}))
+            drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertEqual(bot.handled, [1])
+            self.assertEqual(repo.get_update_offset(), 2)
+
+    def test_duplicate_callback_query_id_is_not_processed_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = RecordingWorkerBot(repo)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=1,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            self.assertTrue(
+                dispatcher.enqueue_update(
+                    {
+                        "update_id": 1,
+                        "partition": "user:1",
+                        "callback_query": {"id": "callback-1"},
+                    }
+                )
+            )
+            self.assertFalse(
+                dispatcher.enqueue_update(
+                    {
+                        "update_id": 2,
+                        "partition": "user:1",
+                        "callback_query": {"id": "callback-1"},
+                    }
+                )
+            )
+            drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertEqual(bot.handled, [1])
+            self.assertEqual(repo.get_update_offset(), 3)
+
+    def test_failed_update_retries_before_terminal_offset_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = FlakyRecordingWorkerBot(repo, failures_before_success=1)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=1,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            update = {"update_id": 1, "partition": "user:1"}
+            self.assertTrue(dispatcher.enqueue_update(update))
+            drain_dispatcher(dispatcher)
+            self.assertEqual(repo.get_update_offset(), 1)
+
+            self.assertTrue(dispatcher.enqueue_update(update))
+            drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertEqual(bot.handled, [1])
+            self.assertEqual(repo.get_update_offset(), 2)
+
+    def test_failed_update_advances_after_max_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = FlakyRecordingWorkerBot(repo, failures_before_success=3)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=1,
+                queue_maxsize=10,
+            )
+            dispatcher.start()
+
+            update = {"update_id": 1, "partition": "user:1"}
+            for _ in range(dispatcher.max_update_attempts):
+                self.assertTrue(dispatcher.enqueue_update(update))
+                drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertEqual(bot.handled, [])
+            self.assertEqual(repo.get_update_offset(), 2)
+
+    def test_full_queue_blocks_until_worker_has_capacity_without_dropping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "bot.sqlite3")
+            bot = RecordingWorkerBot(repo, delay=0.1)
+            dispatcher = PartitionedTelegramUpdateDispatcher(
+                bot,
+                worker_count=1,
+                queue_maxsize=1,
+            )
+
+            self.assertTrue(dispatcher.enqueue_update({"update_id": 1, "partition": "user:1"}))
+            enqueue_finished = threading.Event()
+
+            def enqueue_second() -> None:
+                dispatcher.enqueue_update({"update_id": 2, "partition": "user:1"})
+                enqueue_finished.set()
+
+            thread = threading.Thread(target=enqueue_second)
+            thread.start()
+            time.sleep(0.05)
+            self.assertFalse(enqueue_finished.is_set())
+
+            dispatcher.start()
+            thread.join(timeout=1)
+            drain_dispatcher(dispatcher)
+            dispatcher.stop(timeout=1)
+
+            self.assertTrue(enqueue_finished.is_set())
+            self.assertEqual(bot.handled, [1, 2])
+
+    def test_scheduled_jobs_run_outside_poll_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            scheduled_ran = threading.Event()
+
+            def run_once() -> None:
+                scheduled_ran.set()
+
+            bot.run_once = run_once
+            bot.scheduled_work_interval_seconds = 0
+            bot.start_background_workers()
+            self.assertTrue(scheduled_ran.wait(timeout=1))
+            bot.stop_background_workers(timeout=1)
+
     def test_due_survey_month_only_before_next_month(self) -> None:
         self.assertIsNone(due_survey_month(date(2026, 7, 29), "gregorian", 2))
         self.assertEqual(
@@ -404,6 +680,8 @@ class TelegramBotBusinessTests(unittest.TestCase):
         first_day = next(item for item in schedule if item["gregorian_date"] == "2026-08-01")
         self.assertNotEqual(first_day["main"], "ali_user")
         self.assertNotEqual(first_day["backup"], "ali_user")
+        self.assertEqual(first_day["main"], "sara_user")
+        self.assertEqual(first_day["backup"], "sara_user")
 
     def test_custom_range_config_builds_only_that_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -434,6 +712,45 @@ role = "frontend"
                 [item["gregorian_date"] for item in schedule],
                 ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"],
             )
+
+    def test_schedule_spreads_thursday_roles_without_leaving_thursday_empty(self) -> None:
+        people = [
+            {"name": "person_0", "role": "backend", "unavailable_weekdays": ["thursday"]},
+            {"name": "person_1", "role": "backend"},
+            {"name": "person_2", "role": "backend"},
+            {"name": "person_3", "role": "backend"},
+        ]
+        config = {
+            "calendar": "gregorian",
+            "year": 2026,
+            "month": 8,
+            "people": people,
+        }
+
+        schedule, stats = build_schedule(config)
+        thursday_rows = [
+            item for item in schedule if item["gregorian_date"] in {
+                "2026-08-06",
+                "2026-08-13",
+                "2026-08-20",
+                "2026-08-27",
+            }
+        ]
+
+        self.assertEqual(len(thursday_rows), 4)
+        for row in thursday_rows:
+            self.assertNotEqual(row["main"], "NO_AVAILABLE_PERSON")
+            self.assertNotEqual(row["backup"], "NO_AVAILABLE_BACKUP")
+            self.assertNotEqual(row["main"], "person_0")
+            self.assertNotEqual(row["backup"], "person_0")
+
+        available_stats = [stats[f"person_{index}"] for index in range(1, 4)]
+        main_counts = [item["thursday_main_count"] for item in available_stats]
+        backup_counts = [item["thursday_backup_count"] for item in available_stats]
+        total_counts = [item["thursday_count"] for item in available_stats]
+        self.assertLessEqual(max(main_counts) - min(main_counts), 1)
+        self.assertLessEqual(max(backup_counts) - min(backup_counts), 1)
+        self.assertLessEqual(max(total_counts) - min(total_counts), 1)
 
     def test_local_members_use_configured_availability_and_do_not_block_collection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,6 +819,60 @@ role = "frontend"
         self.assertNotIn("14", visible_texts)
         self.assertNotIn("21", visible_texts)
         self.assertNotIn("28", visible_texts)
+
+    def test_language_is_independent_from_calendar(self) -> None:
+        default_runtime = RuntimeSettings.from_dict(complete_runtime(calendar="jalali"))
+        self.assertEqual(default_runtime.language, "en")
+        self.assertEqual(
+            default_runtime.bot_messages.no_active_survey,
+            "There is no active availability survey right now.",
+        )
+
+        missing_calendar = complete_runtime(language="fa")
+        missing_calendar.pop("calendar")
+        default_calendar_runtime = RuntimeSettings.from_dict(missing_calendar)
+        self.assertEqual(default_calendar_runtime.calendar, "gregorian")
+        self.assertEqual(default_calendar_runtime.language, "fa")
+
+        runtime = RuntimeSettings.from_dict(
+            complete_runtime(calendar="jalali", language="en")
+        )
+
+        self.assertEqual(runtime.calendar, "jalali")
+        self.assertEqual(runtime.language, "en")
+        self.assertEqual(
+            runtime.bot_messages.no_active_survey,
+            "There is no active availability survey right now.",
+        )
+
+        response = AvailabilityResponse(1, "Ali", [], [], False)
+        markup = weekdays_keyboard(response, "jalali", language="ar")
+        button_texts = [
+            button["text"]
+            for row in markup["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("السبت", button_texts)
+        self.assertIn("تأكيد", button_texts)
+
+    def test_cli_can_set_runtime_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path, calendar="jalali")
+
+            args = self._runtime_cli_args(set_runtime_language="ru")
+            handled = handle_local_db_command(repo, bot_settings, args)
+
+            self.assertTrue(handled)
+            runtime = repo.get_runtime_settings()
+            self.assertEqual(runtime.calendar, "jalali")
+            self.assertEqual(runtime.language, "ru")
+            self.assertEqual(
+                runtime.bot_messages.no_active_survey,
+                "Сейчас нет активного опроса доступности.",
+            )
 
     def test_mention_accepts_usernames_with_or_without_at_sign(self) -> None:
         self.assertEqual(
@@ -1201,7 +1572,11 @@ role = "frontend"
             bot.target_month = lambda today=None: (2026, 8)
             bot.run_once = lambda: None
 
+            bot.update_dispatcher.start()
             offset = bot.run_loop_once(None)
+            drain_dispatcher(bot.update_dispatcher)
+            offset = bot.update_dispatcher.offset
+            bot.update_dispatcher.stop(timeout=1)
 
             self.assertEqual(offset, 12)
             self.assertEqual(repo.get_update_offset(), 12)
@@ -1254,8 +1629,8 @@ role = "frontend"
                 }
             )
 
-            self.assertEqual(fake.events[0][0], "edit_message_text")
-            self.assertEqual(fake.events[1][0], "answer_callback_query")
+            self.assertEqual(fake.events[0][0], "answer_callback_query")
+            self.assertEqual(fake.events[1][0], "edit_message_text")
 
     def test_callback_failure_sends_temporary_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1277,7 +1652,8 @@ role = "frontend"
                 }
             )
 
-            self.assertEqual(fake.answers, [])
+            self.assertEqual(fake.answers[-1]["id"], "dates-2")
+            self.assertEqual(fake.answers[-1]["text"], "")
             self.assertEqual(fake.messages[-1]["chat_id"], 1)
             self.assertIn("Temporary Telegram problem", fake.messages[-1]["text"])
 
@@ -1305,6 +1681,8 @@ role = "frontend"
             self.assertTrue(response.confirmed)
             self.assertEqual(fake.answers[-1]["id"], "confirm-saved")
             self.assertEqual(fake.answers[-1]["text"], "")
+            self.assertEqual(fake.events[0][0], "answer_callback_query")
+            self.assertEqual(fake.events[1][0], "edit_message_text")
             self.assertEqual(fake.edits[-1]["reply_markup"], None)
             self.assertIn("Availability saved.", fake.edits[-1]["text"])
             self.assertIn("Status: confirmed", fake.edits[-1]["text"])
@@ -1337,7 +1715,100 @@ role = "frontend"
             self.assertEqual(fake.messages[-1]["chat_id"], 1)
             self.assertIn("Saved, but the form could not be refreshed.", fake.messages[-1]["text"])
 
-    def test_full_available_locks_custom_choices_until_user_changes_mode(self) -> None:
+    def test_start_does_not_reopen_confirmed_survey_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [], [], True, mode="full"),
+            )
+
+            bot.start_member_survey(1, {"id": 1, "username": "ali_user"})
+
+            self.assertEqual(fake.messages[-1]["chat_id"], 1)
+            self.assertEqual(
+                fake.messages[-1]["text"],
+                "Your response has already been submitted. Contact an admin if you need to edit it.",
+            )
+            self.assertEqual(fake.edits, [])
+
+    def test_admin_resend_allows_confirmed_member_to_overwrite_response_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [], [], True, mode="full"),
+            )
+
+            result = bot.resend_survey_form_to_participants(
+                survey.id,
+                [Member("Ali", 1, "ali_user", "backend", True)],
+            )
+
+            self.assertEqual([member.telegram_id for member in result["resent"]], [1])
+            response = repo.get_survey_response(survey.id, 1)
+            self.assertFalse(response.confirmed)
+            self.assertEqual(repo.get_revision_allowlist(survey), [1])
+            self.assertEqual(fake.messages[-1]["chat_id"], 1)
+            self.assertIsNotNone(fake.messages[-1]["reply_markup"])
+
+            bot.handle_availability_callback(
+                {
+                    "id": "custom-after-resend",
+                    "from": {"id": 1},
+                    "data": av(bot, "custom"),
+                    "message": {"chat": {"id": 1}, "message_id": 20},
+                }
+            )
+            bot.handle_availability_callback(
+                {
+                    "id": "day-after-resend",
+                    "from": {"id": 1},
+                    "data": av(bot, "d:add:5"),
+                    "message": {"chat": {"id": 1}, "message_id": 20},
+                }
+            )
+            bot.handle_availability_callback(
+                {
+                    "id": "confirm-after-resend",
+                    "from": {"id": 1},
+                    "data": av(bot, "confirm"),
+                    "message": {"chat": {"id": 1}, "message_id": 20},
+                }
+            )
+
+            response = repo.get_survey_response(survey.id, 1)
+            self.assertTrue(response.confirmed)
+            self.assertEqual(response.mode, "custom")
+            self.assertEqual(response.unavailable_days, [5])
+            self.assertEqual(repo.get_revision_allowlist(survey), [])
+
+            bot.handle_availability_callback(
+                {
+                    "id": "custom-after-final-lock",
+                    "from": {"id": 1},
+                    "data": av(bot, "custom"),
+                    "message": {"chat": {"id": 1}, "message_id": 20},
+                }
+            )
+            response = repo.get_survey_response(survey.id, 1)
+            self.assertEqual(response.mode, "custom")
+            self.assertTrue(response.confirmed)
+            self.assertEqual(response.unavailable_days, [5])
+
+    def test_full_available_confirms_and_locks_form(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bot_settings = settings(tmp_path)
@@ -1360,13 +1831,8 @@ role = "frontend"
             response = repo.get_survey_response(survey.id, 1)
             self.assertEqual(response.mode, "full")
             self.assertTrue(response.confirmed)
-            buttons = [
-                button["callback_data"]
-                for row in fake.edits[-1]["reply_markup"]["inline_keyboard"]
-                for button in row
-            ]
-            self.assertNotIn("av:dates", buttons)
-            self.assertNotIn("av:weekdays", buttons)
+            self.assertIsNone(fake.edits[-1]["reply_markup"])
+            self.assertIn("Availability saved.", fake.edits[-1]["text"])
 
             bot.handle_availability_callback(
                 {
@@ -1377,8 +1843,11 @@ role = "frontend"
                 }
             )
 
-            self.assertEqual(fake.answers[-1]["text"], "Use Change availability first.")
-            self.assertEqual(len(fake.edits), 1)
+            self.assertEqual(
+                fake.answers[-1]["text"],
+                "Your response has already been submitted. Contact an admin if you need to edit it.",
+            )
+            self.assertTrue(fake.answers[-1]["show_alert"])
 
             bot.handle_availability_callback(
                 {
@@ -1390,8 +1859,138 @@ role = "frontend"
             )
 
             response = repo.get_survey_response(survey.id, 1)
-            self.assertEqual(response.mode, "custom")
-            self.assertFalse(response.confirmed)
+            self.assertEqual(response.mode, "full")
+            self.assertTrue(response.confirmed)
+
+    def test_survey_start_invite_opens_form(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+
+            bot.send_survey_by_id(survey.id)
+
+            self.assertEqual(fake.messages[0]["text"], "The monthly availability survey is open. Tap Start to enter your days.")
+            self.assertIn("av:", fake.messages[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"])
+            bot.handle_availability_callback(
+                {
+                    "id": "start-1",
+                    "from": {"id": 1},
+                    "data": av(bot, "start", survey.id),
+                    "message": {"chat": {"id": 1}, "message_id": 1},
+                }
+            )
+
+            self.assertEqual(fake.reply_markup_edits[-1]["reply_markup"], None)
+            self.assertIn("Availability for Ali", fake.edits[-1]["text"])
+            self.assertIsNotNone(fake.edits[-1]["reply_markup"])
+
+    def test_confirm_closes_other_active_survey_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+            repo.record_survey_message(survey.id, 1, 1, 100, kind="form")
+            repo.record_survey_message(survey.id, 1, 1, 101, kind="form")
+
+            bot.handle_availability_callback(
+                {
+                    "id": "confirm-close-old",
+                    "from": {"id": 1},
+                    "data": av(bot, "confirm", survey.id),
+                    "message": {"chat": {"id": 1}, "message_id": 101},
+                }
+            )
+
+            closed = [
+                item
+                for item in fake.reply_markup_edits
+                if item["chat_id"] == 1 and item["message_id"] == 100
+            ]
+            self.assertEqual(len(closed), 1)
+            self.assertEqual(repo.list_active_survey_messages(survey.id, 1), [])
+
+    def test_survey_collection_reminders_and_auto_full_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(
+                repo,
+                collect_until="2026-07-12T12:00:00+03:30",
+            )
+            repo.update_survey(survey.id, starts_at="2026-07-10T09:00:00+03:30")
+            survey = repo.get_survey(survey.id)
+
+            bot.maybe_send_survey_collection_reminders(
+                datetime(2026, 7, 11, 9, 0, tzinfo=ZoneInfo("Asia/Tehran"))
+            )
+            dm_reminders = [
+                message
+                for message in fake.messages
+                if message["text"] == "Reminder: please complete the monthly availability survey."
+            ]
+            self.assertEqual(len(dm_reminders), 2)
+
+            bot.maybe_send_survey_collection_reminders(
+                datetime(2026, 7, 12, 9, 0, tzinfo=ZoneInfo("Asia/Tehran"))
+            )
+            self.assertIn("Last-day reminder", fake.messages[-1]["text"])
+            self.assertEqual(fake.messages[-1]["chat_id"], -100123)
+
+            bot.maybe_create_preview(
+                datetime(2026, 7, 12, 12, 1, tzinfo=ZoneInfo("Asia/Tehran"))
+            )
+            responses = repo.list_survey_responses(survey.id)
+            self.assertTrue(all(response.confirmed for response in responses.values()))
+            self.assertTrue(all(response.mode == "full" for response in responses.values()))
+
+    def test_cli_can_cleanup_old_telegram_update_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            repo.claim_telegram_update(
+                update_id=100,
+                callback_query_id=None,
+                partition_key="message:1",
+                worker_id=0,
+            )
+            repo.mark_telegram_update_processed(100)
+            old = "2026-01-01T00:00:00+00:00"
+            with repo.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE telegram_update_tracking
+                    SET received_at = ?, finished_at = ?
+                    WHERE update_id = 100
+                    """,
+                    (old, old),
+                )
+
+            args = self._runtime_cli_args(
+                cleanup_telegram_updates=True,
+                older_than_days=1,
+            )
+            self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+            with repo.connect() as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM telegram_update_tracking WHERE update_id = 100"
+                ).fetchone()[0]
+            self.assertEqual(count, 0)
 
     def test_preview_approval_and_daily_reminder_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1540,7 +2139,7 @@ role = "frontend"
             )
             repo.save_survey_response(
                 survey.id,
-                AvailabilityResponse(2, "Sara", [], [], True),
+                AvailabilityResponse(2, "Sara", [], ["sunday"], True),
             )
 
             bot.maybe_create_preview(date(2026, 8, 1))
@@ -1624,7 +2223,13 @@ role = "frontend"
             survey = seed_collecting_survey(repo)
             bot.persist_member_response(
                 survey,
-                AvailabilityResponse(1, "Ali", [], ["sunday"], True),
+                AvailabilityResponse(
+                    1,
+                    "Ali",
+                    [],
+                    ["saturday", "sunday", "monday", "tuesday", "wednesday", "thursday"],
+                    True,
+                ),
             )
             bot.persist_member_response(
                 survey,
@@ -1633,7 +2238,11 @@ role = "frontend"
 
             bot.maybe_create_preview(date(2026, 8, 1))
             self.assertLessEqual(len(fake.photos[0]["caption"]), 1024)
+            self.assertIn("Availability fairness risk", fake.messages[-1]["text"])
             self.assertIn("Request corrections will be sent to: Ali", fake.messages[-1]["text"])
+            review = json.loads(repo.get_survey(survey.id).review_json or "{}")
+            self.assertEqual(review["availability_fairness_risks"][0]["name"], "Ali")
+            self.assertEqual(review["flagged_member_ids"], [1])
             fake.messages.clear()
 
             bot.handle_admin_callback(
@@ -2143,7 +2752,13 @@ role = "frontend"
             )
             bot.persist_member_response(
                 debug,
-                AvailabilityResponse(1, "Ali", [], ["sunday"], True),
+                AvailabilityResponse(
+                    1,
+                    "Ali",
+                    [],
+                    ["saturday", "sunday", "monday", "tuesday", "wednesday", "thursday"],
+                    True,
+                ),
             )
             bot.persist_member_response(
                 debug,
@@ -2291,6 +2906,8 @@ role = "frontend"
     def _runtime_cli_args(self, **overrides) -> argparse.Namespace:
         args = argparse.Namespace(
             show_runtime_settings=False,
+            cleanup_telegram_updates=False,
+            older_than_days=90,
             set_telegram_group_chat_id=None,
             set_telegram_topic_id=None,
             clear_telegram_topic_id=False,
@@ -2318,12 +2935,15 @@ role = "frontend"
             set_runtime_poll_interval_seconds=None,
             set_runtime_timezone=None,
             set_runtime_calendar=None,
+            set_runtime_language=None,
             set_bot_name=None,
             set_bot_username=None,
             set_bot_id=None,
             set_telegram_token=None,
             set_output_dir=None,
             set_holidays=None,
+            survey_report=False,
+            survey_member=None,
             survey_kind=None,
             participants=None,
             target_month=None,
@@ -2331,6 +2951,14 @@ role = "frontend"
             survey_collect_for=None,
             revision_collect_for=None,
             send_now=False,
+            add_survey_participants=None,
+            remove_survey_participants=None,
+            resend_survey_form=None,
+            set_survey_availability=None,
+            availability_member=None,
+            unavailable_days=None,
+            unavailable_weekdays=None,
+            availability_mode="custom",
             force_preview=False,
             direct_preview=False,
             publish_now=False,
@@ -2439,6 +3067,188 @@ role = "frontend"
             runtime = repo.get_runtime_settings()
             self.assertIsNone(runtime.target_year)
             self.assertIsNone(runtime.target_month)
+
+    def test_survey_report_shows_delivery_and_response_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo)
+            repo.record_survey_message(survey.id, 1, 1, 101)
+            repo.record_survey_message(survey.id, 2, 2, 102)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [], [], True, mode="full"),
+            )
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(2, "Sara", [5], ["monday"], False),
+            )
+
+            report = format_survey_report(repo, survey)
+
+            self.assertIn("sent=2", report)
+            self.assertIn("confirmed=1", report)
+            self.assertIn("not_confirmed=1", report)
+            self.assertIn("partial_not_confirmed=1", report)
+            self.assertIn("Ali (@ali_user, id=1): confirmed", report)
+            self.assertIn("Sara (@sara_user, id=2): partial-not-confirmed", report)
+            self.assertIn("days=5; weekdays=monday", report)
+
+            filtered = format_survey_report(repo, survey, member_filter="sara_user")
+            self.assertNotIn("Ali (@ali_user", filtered)
+            self.assertIn("Sara (@sara_user", filtered)
+
+    def test_cli_survey_report_uses_active_survey_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            seed_collecting_survey(repo)
+
+            args = self._runtime_cli_args(survey_report=True)
+            with mock.patch("builtins.print") as print_mock:
+                self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+            self.assertIn("Survey:", print_mock.call_args.args[0])
+
+    def test_cli_can_set_survey_availability_for_one_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(2, "Sara", [5], ["sunday"], False, mode="custom"),
+            )
+
+            args = self._runtime_cli_args(
+                set_survey_availability=survey.id,
+                availability_member="sara_user",
+                unavailable_days="",
+                unavailable_weekdays="monday",
+            )
+            self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+            response = repo.get_survey_response(survey.id, 2)
+            self.assertIsNotNone(response)
+            self.assertEqual(response.unavailable_days, [])
+            self.assertEqual(response.unavailable_weekdays, ["monday"])
+            self.assertEqual(response.mode, "custom")
+            self.assertTrue(response.confirmed)
+
+    def test_cli_can_mark_survey_participant_fully_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [3], ["sunday"], False, mode="custom"),
+            )
+
+            args = self._runtime_cli_args(
+                set_survey_availability=survey.id,
+                availability_member="ali_user",
+                availability_mode="full",
+            )
+            self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+            response = repo.get_survey_response(survey.id, 1)
+            self.assertIsNotNone(response)
+            self.assertEqual(response.unavailable_days, [])
+            self.assertEqual(response.unavailable_weekdays, [])
+            self.assertEqual(response.mode, "full")
+            self.assertTrue(response.confirmed)
+
+    def test_cli_can_set_survey_availability_while_pending_admin_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [], [], True, mode="full"),
+            )
+            repo.update_survey(survey.id, status="pending_admin_review")
+
+            args = self._runtime_cli_args(
+                set_survey_availability=survey.id,
+                availability_member="ali_user",
+                unavailable_days="",
+                unavailable_weekdays="sunday",
+            )
+            self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+            response = repo.get_survey_response(survey.id, 1)
+            self.assertEqual(response.mode, "custom")
+            self.assertEqual(response.unavailable_days, [])
+            self.assertEqual(response.unavailable_weekdays, ["sunday"])
+            self.assertTrue(response.confirmed)
+
+    def test_cli_can_update_live_schedule_main_or_backup_individually(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            with connect_db(bot_settings.database_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO schedule_entries (
+                        year, month, work_date, weekday, holiday, main, backup
+                    ) VALUES (2026, 8, '2026-08-03', 'monday', '', 'ali_user', 'sara_user')
+                    """
+                )
+            repo.set_active_schedule_source(2026, 8)
+
+            self.assertTrue(
+                handle_local_db_command(
+                    repo,
+                    bot_settings,
+                    self._runtime_cli_args(
+                        set_schedule_entry_date="2026-08-03",
+                        entry_main="neda_user",
+                    ),
+                )
+            )
+            with connect_db(bot_settings.database_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT main, backup
+                    FROM schedule_entries
+                    WHERE work_date = '2026-08-03'
+                    """
+                ).fetchone()
+            self.assertEqual(tuple(row), ("neda_user", "sara_user"))
+
+            self.assertTrue(
+                handle_local_db_command(
+                    repo,
+                    bot_settings,
+                    self._runtime_cli_args(
+                        set_schedule_entry_date="2026-08-03",
+                        entry_backup="omid_user",
+                    ),
+                )
+            )
+            with connect_db(bot_settings.database_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT main, backup
+                    FROM schedule_entries
+                    WHERE work_date = '2026-08-03'
+                    """
+                ).fetchone()
+            self.assertEqual(tuple(row), ("neda_user", "omid_user"))
 
     def test_daily_reminder_uses_db_reminder_time_and_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2903,6 +3713,148 @@ role = "frontend"
             bot.resume_collecting_form_delivery()
             self.assertEqual([message["chat_id"] for message in fake.messages], [2])
             self.assertIsNotNone(repo.get_survey_message(survey.id, 2))
+
+    def test_add_survey_participants_sends_only_new_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+            bot.send_survey_by_id(survey.id)
+            messages_before = len(fake.messages)
+            edits_before = len(fake.edits)
+            for username, name, telegram_id in (
+                ("neda_user", "Neda", 4),
+                ("omid_user", "Omid", 5),
+            ):
+                repo.upsert_user(
+                    username=username,
+                    display_name=name,
+                    role="backend",
+                    access_level="member",
+                    telegram_id=telegram_id,
+                    active=True,
+                    participates_in_schedule=True,
+                )
+
+            result = bot.add_survey_participants_and_send(
+                survey.id,
+                [
+                    Member("Ali", 1, "ali_user", "backend", True),
+                    Member("Neda", 4, "neda_user", "backend", True),
+                    Member("Omid", 5, "omid_user", "backend", True),
+                ],
+            )
+
+            self.assertEqual([member.telegram_id for member in result["already_present"]], [1])
+            self.assertEqual([member.telegram_id for member in result["sent"]], [4, 5])
+            self.assertEqual(len(fake.messages), messages_before + 2)
+            self.assertEqual([message["chat_id"] for message in fake.messages[-2:]], [4, 5])
+            self.assertEqual(len(fake.edits), edits_before)
+            participant_ids = sorted(
+                member.telegram_id
+                for member in repo.list_survey_participants(survey.id)
+            )
+            self.assertEqual(participant_ids, [1, 2, 4, 5])
+
+    def test_add_survey_participants_reopens_canceled_survey_without_resending_old_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path, survey_collect_for="+3d")
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+            bot.send_survey_by_id(survey.id)
+            messages_before = len(fake.messages)
+            repo.update_survey(survey.id, status="canceled")
+            repo.upsert_user(
+                username="neda_user",
+                display_name="Neda",
+                role="backend",
+                access_level="member",
+                telegram_id=4,
+                active=True,
+                participates_in_schedule=True,
+            )
+
+            result = bot.add_survey_participants_and_send(
+                survey.id,
+                [Member("Neda", 4, "neda_user", "backend", True)],
+            )
+
+            reopened = repo.get_survey(survey.id)
+            self.assertEqual(reopened.status, "collecting")
+            self.assertEqual(repo.get_active_survey(SURVEY_KIND_PRODUCTION).id, survey.id)
+            self.assertEqual([member.telegram_id for member in result["sent"]], [4])
+            self.assertEqual(len(fake.messages), messages_before + 1)
+            self.assertEqual(fake.messages[-1]["chat_id"], 4)
+
+    def test_cli_can_remove_survey_participants_from_editable_survey(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo)
+            repo.record_survey_message(survey.id, 1, 1, 101)
+            repo.record_survey_message(survey.id, 2, 2, 102)
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(1, "Ali", [], [], True, mode="full"),
+            )
+            repo.save_survey_response(
+                survey.id,
+                AvailabilityResponse(2, "Sara", [2], [], False, mode="custom"),
+            )
+
+            args = self._runtime_cli_args(
+                remove_survey_participants=survey.id,
+                participants="ali_user",
+            )
+            self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+            participant_ids = sorted(
+                member.telegram_id for member in repo.list_survey_participants(survey.id)
+            )
+            self.assertEqual(participant_ids, [2])
+            self.assertIsNone(repo.get_survey_response(survey.id, 1))
+            self.assertIsNone(repo.get_survey_message(survey.id, 1))
+            self.assertIsNotNone(repo.get_survey_response(survey.id, 2))
+            self.assertIsNotNone(repo.get_survey_message(survey.id, 2))
+
+    def test_cli_rejects_remove_survey_participants_for_non_editable_survey(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            survey = seed_collecting_survey(repo, status="approved")
+
+            args = self._runtime_cli_args(
+                remove_survey_participants=survey.id,
+                participants="ali_user",
+            )
+            with self.assertRaises(SystemExit) as ctx:
+                handle_local_db_command(repo, bot_settings, args)
+            self.assertIn("Can only remove participants while survey is editable", str(ctx.exception))
+
+    def test_build_bot_can_skip_export_support_for_non_preview_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            with mock.patch(
+                "adhoc_assistant.telegram_bot.service.ensure_jpg_export_support",
+                side_effect=RuntimeError("rsvg-convert is required"),
+            ):
+                bot = build_bot(bot_settings, repo, require_export_support=False)
+            self.assertIsInstance(bot, AdhocTelegramBot)
 
     def test_production_unregistered_members_are_warned_not_auto_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

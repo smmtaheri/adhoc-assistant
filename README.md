@@ -141,6 +141,11 @@ docker compose --profile cli run --rm adhoc-assistant-cli
 
 ## Telegram Bot
 
+For the regular user's business flow, see
+[`docs/user-business-flow.md`](docs/user-business-flow.md).
+For schedule fairness and coverage rules, see
+[`docs/scheduling-rules.md`](docs/scheduling-rules.md).
+
 ### Source of truth
 
 | Source | What belongs here |

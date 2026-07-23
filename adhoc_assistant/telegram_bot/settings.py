@@ -8,7 +8,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from adhoc_assistant.constants import DEFAULT_DB_PATH
-from adhoc_assistant.telegram_bot.messages import BotMessages
+from adhoc_assistant.telegram_bot.messages import (
+    BotMessages,
+    normalize_language,
+)
 
 
 @dataclass(frozen=True)
@@ -26,7 +29,6 @@ class Member:
 # Keys that must exist in DB runtime_settings before the bot can run.
 RUNTIME_REQUIRED_KEYS = (
     "timezone",
-    "calendar",
     "survey_days_before_month",
     "survey_start_at",
     "survey_collect_for",
@@ -48,6 +50,7 @@ class RuntimeSettings:
 
     timezone: str
     calendar: str
+    language: str
     survey_days_before_month: int
     survey_start_at: str
     survey_collect_for: str
@@ -62,15 +65,18 @@ class RuntimeSettings:
     telegram_token: str
     output_dir: str
     holidays: list
+    telegram_worker_count: int = 4
+    telegram_queue_maxsize: int = 100
     allow_production_destination: bool = False
     bot_messages: BotMessages = field(
-        default_factory=lambda: BotMessages.resolve(None, "gregorian")
+        default_factory=lambda: BotMessages.resolve(None, "en", "gregorian")
     )
 
     def as_dict(self) -> dict:
         return {
             "timezone": self.timezone,
             "calendar": self.calendar,
+            "language": self.language,
             "survey_days_before_month": self.survey_days_before_month,
             "survey_start_at": self.survey_start_at,
             "survey_collect_for": self.survey_collect_for,
@@ -79,6 +85,8 @@ class RuntimeSettings:
             "target_month": self.target_month,
             "daily_reminder_time": self.daily_reminder_time,
             "poll_interval_seconds": self.poll_interval_seconds,
+            "telegram_worker_count": self.telegram_worker_count,
+            "telegram_queue_maxsize": self.telegram_queue_maxsize,
             "bot_name": self.bot_name,
             "bot_username": self.bot_username,
             "bot_id": self.bot_id,
@@ -116,13 +124,15 @@ class RuntimeSettings:
             holidays = []
         if not isinstance(holidays, list):
             raise RuntimeError("runtime_settings.holidays must be a JSON list.")
-        calendar = str(raw["calendar"])
+        calendar = str(raw.get("calendar") or "gregorian").strip()
+        language = normalize_language(raw.get("language"), calendar)
         bot_messages_raw = raw.get("bot_messages")
         if bot_messages_raw is not None and not isinstance(bot_messages_raw, dict):
             raise RuntimeError("runtime_settings.bot_messages must be a JSON object.")
         return cls(
             timezone=str(raw["timezone"]),
             calendar=calendar,
+            language=language,
             survey_days_before_month=int(raw["survey_days_before_month"]),
             survey_start_at=str(raw["survey_start_at"]).strip(),
             survey_collect_for=str(raw["survey_collect_for"]).strip(),
@@ -131,6 +141,8 @@ class RuntimeSettings:
             target_month=int(target_month) if target_month not in (None, "", 0) else None,
             daily_reminder_time=str(raw["daily_reminder_time"]),
             poll_interval_seconds=int(raw["poll_interval_seconds"]),
+            telegram_worker_count=max(1, int(raw.get("telegram_worker_count", 4))),
+            telegram_queue_maxsize=max(1, int(raw.get("telegram_queue_maxsize", 100))),
             bot_name=str(raw["bot_name"]),
             bot_username=str(raw["bot_username"]),
             bot_id=int(raw["bot_id"]),
@@ -138,7 +150,7 @@ class RuntimeSettings:
             output_dir=str(raw["output_dir"]).strip(),
             holidays=list(holidays),
             allow_production_destination=bool(raw.get("allow_production_destination", False)),
-            bot_messages=BotMessages.resolve(bot_messages_raw, calendar),
+            bot_messages=BotMessages.resolve(bot_messages_raw, language, calendar),
         )
 
 

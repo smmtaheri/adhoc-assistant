@@ -13,6 +13,8 @@ def empty_person_stats() -> dict[str, Any]:
         "backup_count": 0,
         "total_count": 0,
         "thursday_count": 0,
+        "thursday_main_count": 0,
+        "thursday_backup_count": 0,
         "weekday_count": defaultdict(int),
     }
 
@@ -121,8 +123,28 @@ def choose_person(
     if not candidates:
         return None
 
-    candidates.sort(
-        key=lambda person: (
+    weekday = WEEKDAY_NAMES[current_day.weekday()]
+
+    def candidate_sort_key(person: dict) -> tuple:
+        if weekday == "Thursday":
+            person_stats = stats[person["name"]]
+            role_thursday_key = (
+                "thursday_main_count" if role == "main" else "thursday_backup_count"
+            )
+            return (
+                person_stats[role_thursday_key],
+                person_stats["thursday_count"],
+                score_candidate(
+                    person=person,
+                    current_day=current_day,
+                    role=role,
+                    stats=stats,
+                    history=history,
+                    previous_main=previous_main,
+                ),
+                person["name"],
+            )
+        return (
             score_candidate(
                 person=person,
                 current_day=current_day,
@@ -133,6 +155,9 @@ def choose_person(
             ),
             person["name"],
         )
+
+    candidates.sort(
+        key=candidate_sort_key
     )
 
     return candidates[0]
@@ -198,8 +223,8 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
             exclude_names={main["name"]},
         )
 
-        backup_name = "NO_AVAILABLE_BACKUP" if backup is None else backup["name"]
         main_name = main["name"]
+        backup_name = main_name if backup is None else backup["name"]
 
         schedule.append(
             {
@@ -219,14 +244,15 @@ def build_schedule(config: dict, db_history: dict | None = None) -> tuple[list[d
 
         if weekday == "Thursday":
             stats[main_name]["thursday_count"] += 1
+            stats[main_name]["thursday_main_count"] += 1
 
-        if backup is not None:
-            stats[backup_name]["backup_count"] += 1
-            stats[backup_name]["total_count"] += 1
-            stats[backup_name]["weekday_count"][weekday] += 1
+        stats[backup_name]["backup_count"] += 1
+        stats[backup_name]["total_count"] += 1
+        stats[backup_name]["weekday_count"][weekday] += 1
 
-            if weekday == "Thursday":
-                stats[backup_name]["thursday_count"] += 1
+        if weekday == "Thursday":
+            stats[backup_name]["thursday_count"] += 1
+            stats[backup_name]["thursday_backup_count"] += 1
 
         previous_main = main_name
 

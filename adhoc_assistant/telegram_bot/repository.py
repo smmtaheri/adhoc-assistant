@@ -244,6 +244,23 @@ class BotRepository:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS survey_message_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    survey_id TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'form',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    UNIQUE(survey_id, telegram_id, chat_id, message_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS availability_responses (
                     calendar_type TEXT NOT NULL,
                     year INTEGER NOT NULL,
@@ -282,6 +299,23 @@ class BotRepository:
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_update_tracking (
+                    update_id INTEGER PRIMARY KEY,
+                    callback_query_id TEXT UNIQUE,
+                    status TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    worker_id INTEGER NOT NULL,
+                    received_at TEXT NOT NULL,
+                    enqueued_at TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
                 )
                 """
             )
@@ -353,6 +387,36 @@ class BotRepository:
                 "surveys",
                 "kind",
                 "TEXT NOT NULL DEFAULT 'production'",
+            )
+            self.ensure_column(
+                conn,
+                "telegram_update_tracking",
+                "attempt_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO survey_message_history (
+                    survey_id,
+                    telegram_id,
+                    chat_id,
+                    message_id,
+                    kind,
+                    active,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    survey_id,
+                    telegram_id,
+                    chat_id,
+                    message_id,
+                    'form',
+                    1,
+                    updated_at,
+                    updated_at
+                FROM survey_messages
+                """
             )
 
     def ensure_column(
@@ -708,6 +772,244 @@ class BotRepository:
         if not state:
             return None
         return int(state["offset"])
+
+    def claim_telegram_update(
+        self,
+        *,
+        update_id: int,
+        callback_query_id: str | None,
+        partition_key: str,
+        worker_id: int,
+    ) -> bool:
+        now = utc_now()
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO telegram_update_tracking (
+                        update_id,
+                        callback_query_id,
+                        status,
+                        partition_key,
+                        worker_id,
+                        received_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(update_id),
+                        callback_query_id or None,
+                        "claimed",
+                        partition_key,
+                        int(worker_id),
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT status
+                    FROM telegram_update_tracking
+                    WHERE update_id = ?
+                    """,
+                    (int(update_id),),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO telegram_update_tracking (
+                            update_id,
+                            callback_query_id,
+                            status,
+                            partition_key,
+                            worker_id,
+                            received_at,
+                            finished_at,
+                            error
+                        )
+                        VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(update_id),
+                            "skipped_duplicate",
+                            partition_key,
+                            int(worker_id),
+                            now,
+                            now,
+                            (
+                                f"duplicate callback_query_id={callback_query_id}"
+                                if callback_query_id
+                                else "duplicate telegram update"
+                            ),
+                        ),
+                    )
+                    return False
+                if row[0] != "pending_retry":
+                    return False
+                conn.execute(
+                    """
+                    UPDATE telegram_update_tracking
+                    SET callback_query_id = ?,
+                        status = ?,
+                        partition_key = ?,
+                        worker_id = ?,
+                        received_at = ?,
+                        enqueued_at = NULL,
+                        started_at = NULL,
+                        finished_at = NULL,
+                        error = NULL
+                    WHERE update_id = ?
+                    """,
+                    (
+                        callback_query_id or None,
+                        "claimed",
+                        partition_key,
+                        int(worker_id),
+                        now,
+                        int(update_id),
+                    ),
+                )
+        return True
+
+    def mark_telegram_update_enqueued(self, update_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_update_tracking
+                SET status = ?, enqueued_at = ?
+                WHERE update_id = ? AND status = ?
+                """,
+                ("enqueued", utc_now(), int(update_id), "claimed"),
+            )
+
+    def mark_telegram_update_started(self, update_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_update_tracking
+                SET status = ?, started_at = ?
+                WHERE update_id = ? AND status IN ('claimed', 'enqueued', 'pending_retry')
+                """,
+                ("processing", utc_now(), int(update_id)),
+            )
+
+    def mark_telegram_update_processed(self, update_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_update_tracking
+                SET status = ?, finished_at = ?, error = NULL
+                WHERE update_id = ?
+                """,
+                ("processed", utc_now(), int(update_id)),
+            )
+
+    def mark_telegram_update_failed(
+        self,
+        update_id: int,
+        error: str,
+        *,
+        max_attempts: int = 3,
+    ) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempt_count
+                FROM telegram_update_tracking
+                WHERE update_id = ?
+                """,
+                (int(update_id),),
+            ).fetchone()
+            attempt_count = (int(row[0]) if row is not None else 0) + 1
+            status = "failed_terminal" if attempt_count >= max(1, int(max_attempts)) else "pending_retry"
+            conn.execute(
+                """
+                UPDATE telegram_update_tracking
+                SET status = ?, finished_at = ?, attempt_count = ?, error = ?
+                WHERE update_id = ?
+                """,
+                (status, utc_now(), attempt_count, error[:1000], int(update_id)),
+            )
+        return status
+
+    def cleanup_telegram_update_tracking(self, cutoff: datetime) -> int:
+        cutoff_utc = cutoff
+        if cutoff_utc.tzinfo is None:
+            cutoff_utc = cutoff_utc.replace(tzinfo=timezone.utc)
+        else:
+            cutoff_utc = cutoff_utc.astimezone(timezone.utc)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM telegram_update_tracking
+                WHERE status IN ('processed', 'skipped_duplicate', 'failed_terminal')
+                  AND COALESCE(finished_at, received_at) < ?
+                """,
+                (cutoff_utc.isoformat(timespec="seconds"),),
+            )
+            return int(cursor.rowcount or 0)
+
+    def reset_incomplete_telegram_updates(self) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_update_tracking
+                SET status = ?, enqueued_at = NULL, started_at = NULL, finished_at = NULL, error = NULL
+                WHERE status IN ('claimed', 'enqueued', 'processing')
+                """,
+                ("pending_retry",),
+            )
+
+    def advance_update_offset_from_tracking(self, current_offset: int | None) -> int | None:
+        with self.connect() as conn:
+            if current_offset is None:
+                row = conn.execute(
+                    """
+                    SELECT MIN(update_id)
+                    FROM telegram_update_tracking
+                    """
+                ).fetchone()
+                if row is None or row[0] is None:
+                    return None
+                offset = int(row[0])
+            else:
+                offset = int(current_offset)
+
+            while True:
+                row = conn.execute(
+                    """
+                    SELECT status
+                    FROM telegram_update_tracking
+                    WHERE update_id = ?
+                    """,
+                    (offset,),
+                ).fetchone()
+                if row is None:
+                    next_row = conn.execute(
+                        """
+                        SELECT MIN(update_id)
+                        FROM telegram_update_tracking
+                        WHERE update_id > ?
+                        """,
+                        (offset,),
+                    ).fetchone()
+                    if next_row is None or next_row[0] is None:
+                        break
+                    offset = int(next_row[0])
+                    continue
+                if row[0] not in {
+                    "processed",
+                    "skipped_duplicate",
+                    "failed_terminal",
+                }:
+                    break
+                offset += 1
+
+        if current_offset is not None and offset == int(current_offset):
+            return current_offset
+        self.set_update_offset(offset)
+        return offset
 
     def normalize_survey_kind(self, kind: str) -> str:
         normalized = kind.strip().lower()
@@ -1091,6 +1393,17 @@ class BotRepository:
     def clear_revision_allowlist(self, kind: str) -> None:
         kind = self.normalize_survey_kind(kind)
         self.delete_state(active_survey_phase_state_key(kind))
+
+    def remove_revision_allowlist_members(self, survey: Survey, member_ids: list[int]) -> None:
+        if not member_ids:
+            return
+        current = self.get_revision_allowlist(survey)
+        blocked = {int(item) for item in member_ids}
+        remaining = [item for item in current if int(item) not in blocked]
+        if remaining:
+            self.set_revision_allowlist(survey, remaining)
+        else:
+            self.clear_revision_allowlist(survey.kind)
 
     def clear_active_survey_phase(self, kind: str) -> None:
         """Clear revision allowlist and active survey pointer for kind."""
@@ -1520,13 +1833,162 @@ class BotRepository:
             for row in rows
         ]
 
+    def add_survey_participants(
+        self,
+        survey_id: str,
+        participants: list[Member],
+    ) -> tuple[list[Member], list[Member]]:
+        existing_ids = {
+            member.telegram_id
+            for member in self.list_survey_participants(survey_id)
+        }
+        seen_ids: set[int] = set()
+        added: list[Member] = []
+        already_present: list[Member] = []
+        rows = []
+        for member in participants:
+            participant_id = stable_participant_id(member)
+            if participant_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate survey participant identity for {member.name!r} "
+                    f"(id={participant_id})."
+                )
+            seen_ids.add(participant_id)
+            normalized = Member(
+                name=member.name,
+                telegram_id=participant_id,
+                username=normalize_username(member.username),
+                role=member.role,
+                active=member.active,
+                unavailable_days=list(member.unavailable_days),
+                unavailable_weekdays=list(member.unavailable_weekdays),
+                access_level=member.access_level,
+                participates_in_schedule=member.participates_in_schedule,
+            )
+            if participant_id in existing_ids:
+                already_present.append(normalized)
+                continue
+            added.append(normalized)
+            rows.append(
+                (
+                    survey_id,
+                    participant_id,
+                    normalized.username,
+                    normalized.name,
+                    normalized.role,
+                    normalized.access_level,
+                    1 if normalized.participates_in_schedule else 0,
+                    1 if normalized.active else 0,
+                    json.dumps(sorted(normalized.unavailable_days)),
+                    json.dumps(sorted(normalized.unavailable_weekdays)),
+                )
+            )
+
+        if rows:
+            with self.connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO survey_participants (
+                        survey_id,
+                        telegram_id,
+                        username,
+                        name,
+                        role,
+                        access_level,
+                        participates_in_schedule,
+                        active,
+                        unavailable_days,
+                        unavailable_weekdays
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+        return added, already_present
+
+    def remove_survey_participants(
+        self,
+        survey_id: str,
+        participants: list[Member],
+    ) -> tuple[list[Member], list[Member]]:
+        existing = {
+            member.telegram_id: member
+            for member in self.list_survey_participants(survey_id)
+        }
+        seen_ids: set[int] = set()
+        removed: list[Member] = []
+        not_present: list[Member] = []
+        target_ids: list[int] = []
+        for member in participants:
+            participant_id = stable_participant_id(member)
+            if participant_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate survey participant identity for {member.name!r} "
+                    f"(id={participant_id})."
+                )
+            seen_ids.add(participant_id)
+            existing_member = existing.get(participant_id)
+            if existing_member is None:
+                not_present.append(
+                    Member(
+                        name=member.name,
+                        telegram_id=participant_id,
+                        username=normalize_username(member.username),
+                        role=member.role,
+                        active=member.active,
+                        unavailable_days=list(member.unavailable_days),
+                        unavailable_weekdays=list(member.unavailable_weekdays),
+                        access_level=member.access_level,
+                        participates_in_schedule=member.participates_in_schedule,
+                    )
+                )
+                continue
+            removed.append(existing_member)
+            target_ids.append(participant_id)
+
+        if target_ids:
+            placeholders = ", ".join("?" for _ in target_ids)
+            params = [survey_id, *target_ids]
+            with self.connect() as conn:
+                conn.execute(
+                    f"""
+                    DELETE FROM survey_participants
+                    WHERE survey_id = ? AND telegram_id IN ({placeholders})
+                    """,
+                    params,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM survey_responses
+                    WHERE survey_id = ? AND telegram_id IN ({placeholders})
+                    """,
+                    params,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM survey_messages
+                    WHERE survey_id = ? AND telegram_id IN ({placeholders})
+                    """,
+                    params,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM survey_message_history
+                    WHERE survey_id = ? AND telegram_id IN ({placeholders})
+                    """,
+                    params,
+                )
+        return removed, not_present
+
     def record_survey_message(
         self,
         survey_id: str,
         telegram_id: int,
         chat_id: int,
         message_id: int,
+        kind: str = "form",
     ) -> None:
+        now = utc_now()
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1544,7 +2006,37 @@ class BotRepository:
                     message_id = excluded.message_id,
                     updated_at = excluded.updated_at
                 """,
-                (survey_id, telegram_id, chat_id, message_id, utc_now()),
+                (survey_id, telegram_id, chat_id, message_id, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO survey_message_history (
+                    survey_id,
+                    telegram_id,
+                    chat_id,
+                    message_id,
+                    kind,
+                    active,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(survey_id, telegram_id, chat_id, message_id)
+                DO UPDATE SET
+                    kind = excluded.kind,
+                    active = 1,
+                    updated_at = excluded.updated_at,
+                    closed_at = NULL
+                """,
+                (
+                    survey_id,
+                    int(telegram_id),
+                    int(chat_id),
+                    int(message_id),
+                    kind,
+                    now,
+                    now,
+                ),
             )
 
     def get_survey_message(self, survey_id: str, telegram_id: int) -> dict | None:
@@ -1560,6 +2052,135 @@ class BotRepository:
         if row is None:
             return None
         return {"chat_id": int(row[0]), "message_id": int(row[1])}
+
+    def list_survey_messages(self, survey_id: str) -> dict[int, dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT telegram_id, chat_id, message_id, updated_at
+                FROM survey_messages
+                WHERE survey_id = ?
+                """,
+                (survey_id,),
+            ).fetchall()
+        return {
+            int(row[0]): {
+                "chat_id": int(row[1]),
+                "message_id": int(row[2]),
+                "updated_at": row[3],
+            }
+            for row in rows
+        }
+
+    def list_active_survey_messages(
+        self,
+        survey_id: str,
+        telegram_id: int | None = None,
+        *,
+        kind: str | None = None,
+    ) -> list[dict]:
+        clauses = ["survey_id = ?", "active = 1"]
+        params: list = [survey_id]
+        if telegram_id is not None:
+            clauses.append("telegram_id = ?")
+            params.append(int(telegram_id))
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = " AND ".join(clauses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, survey_id, telegram_id, chat_id, message_id, kind, active, created_at, updated_at, closed_at
+                FROM survey_message_history
+                WHERE {where}
+                ORDER BY id ASC
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "survey_id": row[1],
+                "telegram_id": int(row[2]),
+                "chat_id": int(row[3]),
+                "message_id": int(row[4]),
+                "kind": row[5],
+                "active": bool(row[6]),
+                "created_at": row[7],
+                "updated_at": row[8],
+                "closed_at": row[9],
+            }
+            for row in rows
+        ]
+
+    def mark_survey_messages_inactive(
+        self,
+        survey_id: str,
+        telegram_id: int | None = None,
+        *,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+        kind: str | None = None,
+    ) -> int:
+        clauses = ["survey_id = ?", "active = 1"]
+        params: list = [survey_id]
+        if telegram_id is not None:
+            clauses.append("telegram_id = ?")
+            params.append(int(telegram_id))
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(int(chat_id))
+        if message_id is not None:
+            clauses.append("message_id = ?")
+            params.append(int(message_id))
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = " AND ".join(clauses)
+        now = utc_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE survey_message_history
+                SET active = 0,
+                    closed_at = ?,
+                    updated_at = ?
+                WHERE {where}
+                """,
+                [now, now, *params],
+            )
+            return int(cursor.rowcount or 0)
+
+    def list_survey_response_details(self, survey_id: str) -> dict[int, dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    telegram_id,
+                    name,
+                    unavailable_days,
+                    unavailable_weekdays,
+                    confirmed,
+                    availability_mode,
+                    updated_at
+                FROM survey_responses
+                WHERE survey_id = ?
+                """,
+                (survey_id,),
+            ).fetchall()
+        return {
+            int(row[0]): {
+                "telegram_id": int(row[0]),
+                "name": row[1],
+                "unavailable_days": json.loads(row[2]),
+                "unavailable_weekdays": json.loads(row[3]),
+                "confirmed": bool(row[4]),
+                "mode": row[5],
+                "updated_at": row[6],
+            }
+            for row in rows
+        }
 
     def upsert_monthly_run(
         self,
@@ -1675,9 +2296,11 @@ class BotRepository:
     def set_schedule_entry_people(
         self,
         work_date: str,
-        main: str,
-        backup: str,
+        main: str | None = None,
+        backup: str | None = None,
     ) -> bool:
+        if main is None and backup is None:
+            return False
         source = self.get_active_schedule_source()
         with self.connect() as conn:
             if source is None:
@@ -1686,7 +2309,8 @@ class BotRepository:
             cursor = conn.execute(
                 """
                 UPDATE schedule_entries
-                SET main = ?, backup = ?
+                SET main = COALESCE(?, main),
+                    backup = COALESCE(?, backup)
                 WHERE work_date = ? AND year = ? AND month = ?
                 """,
                 (main, backup, work_date, year, month),
