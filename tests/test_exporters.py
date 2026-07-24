@@ -94,6 +94,71 @@ class ImageExporterTests(unittest.TestCase):
         self.assertIn('text-anchor="start"', svg)
         self.assertIn("Monthly summary", svg)
 
+    def test_gregorian_svg_can_use_persian_language_rtl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "schedule.svg"
+            export_image_calendar(
+                sample_schedule(),
+                2026,
+                6,
+                "gregorian",
+                output_path,
+                stats={"Ali": {"main_count": 1, "backup_count": 0, "total_count": 1}},
+                language="fa",
+            )
+
+            svg = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("برنامه ادهاک ژوئن ۲۰۲۶", svg)
+        self.assertIn("آمار ماهانه", svg)
+        self.assertIn("روز باگ", svg)
+        self.assertIn('direction="rtl"', svg)
+        self.assertIn(">شنبه</text>", svg)
+        self.assertNotIn("Monthly summary", svg)
+
+    def test_jalali_svg_can_use_english_language_ltr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "schedule.svg"
+            export_image_calendar(
+                sample_schedule(),
+                1405,
+                4,
+                "jalali",
+                output_path,
+                stats={"Ali": {"main_count": 1, "backup_count": 0, "total_count": 1}},
+                language="en",
+            )
+
+            svg = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("Adhoc Schedule - Tir 1405", svg)
+        self.assertIn("Monthly summary", svg)
+        self.assertIn("Bug Day", svg)
+        self.assertIn('direction="ltr"', svg)
+        self.assertIn(">Thursday</text>", svg)
+        self.assertNotIn("برنامه ادهاک", svg)
+
+    def test_arabic_svg_uses_arabic_text_and_rtl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "schedule.svg"
+            export_image_calendar(
+                sample_schedule(),
+                2026,
+                6,
+                "gregorian",
+                output_path,
+                stats={"Ali": {"main_count": 1, "backup_count": 0, "total_count": 1}},
+                language="ar",
+            )
+
+            svg = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("جدول Adhoc - يونيو ٢٠٢٦", svg)
+        self.assertIn("الملخص الشهري", svg)
+        self.assertIn("المسؤول الأساسي", svg)
+        self.assertIn('direction="rtl"', svg)
+        self.assertIn(">السبت</text>", svg)
+
     def test_svg_summary_wraps_long_names_away_from_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "schedule.svg"

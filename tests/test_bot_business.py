@@ -374,6 +374,7 @@ class TelegramBotBusinessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.last_export_schedule = None
         self.last_export_stats = None
+        self.last_export_language = None
         self.image_exporter_patch = mock.patch(
             "adhoc_assistant.telegram_bot.service.export_image_calendar",
             side_effect=self.fake_export_image_calendar,
@@ -391,9 +392,11 @@ class TelegramBotBusinessTests(unittest.TestCase):
         calendar_type,
         output_path,
         stats=None,
+        language=None,
     ) -> None:
         self.last_export_schedule = schedule
         self.last_export_stats = stats
+        self.last_export_language = language
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"fake jpg")
 
@@ -854,6 +857,53 @@ role = "frontend"
         ]
         self.assertIn("السبت", button_texts)
         self.assertIn("تأكيد", button_texts)
+
+    def test_preview_uses_runtime_language_for_caption_buttons_and_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path, calendar="gregorian", language="fa")
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            survey = seed_collecting_survey(repo)
+
+            bot.create_preview(2026, 8, survey_id=survey.id)
+
+            self.assertEqual(self.last_export_language, "fa")
+            self.assertIn("پیش‌نمایش", fake.photos[0]["caption"])
+            self.assertIn("اوت ۲۰۲۶", fake.photos[0]["caption"])
+            approve_button = fake.photos[0]["reply_markup"]["inline_keyboard"][0][0]["text"]
+            self.assertEqual(approve_button, "تایید برنامه")
+
+    def test_daily_reminder_uses_runtime_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path, calendar="gregorian", language="fa")
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
+            fake = FakeTelegram()
+            bot = AdhocTelegramBot(bot_settings, members(), repo, fake)
+            work_date = "2026-08-01"
+            with connect_db(bot_settings.database_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO schedule_entries (
+                        year, month, work_date, weekday, holiday, main, backup
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (2026, 8, work_date, "Saturday", "", "Ali", "Sara"),
+                )
+            repo.set_active_schedule_source(2026, 8)
+
+            bot.send_daily_reminder(datetime(2026, 8, 1, 9, 0, tzinfo=ZoneInfo("Asia/Tehran")))
+
+            self.assertIn("صبح بخیر", fake.messages[-1]["text"])
+            self.assertIn("روز باگ", fake.messages[-1]["text"])
+            self.assertNotIn("Good morning", fake.messages[-1]["text"])
 
     def test_cli_can_set_runtime_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

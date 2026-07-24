@@ -23,7 +23,11 @@ from adhoc_assistant.calendars import (
 )
 from adhoc_assistant.config import normalize_holidays, normalize_weekday
 from adhoc_assistant.constants import VALID_WEEKDAYS
-from adhoc_assistant.exporters import ensure_jpg_export_support, export_image_calendar
+from adhoc_assistant.exporters import (
+    ensure_jpg_export_support,
+    export_image_calendar,
+    localized_month_title,
+)
 from adhoc_assistant.scheduler import build_schedule, is_available, month_workdays, stats_to_plain_dict
 from adhoc_assistant.storage import load_history_from_db, save_month_to_db
 from adhoc_assistant.telegram_bot.access import (
@@ -110,6 +114,42 @@ SERVICE_TEXTS = {
         "review_member_line": "- {name}: unavailable {unavailable}/{workdays}, {percent}% available, {confirmed}",
         "confirmed": "confirmed",
         "not_confirmed": "not confirmed",
+        "temporary_telegram_error": "Temporary Telegram problem. Please try again in a moment.",
+        "survey_label": "{month} · {survey_id} · {status}",
+        "survey_id_label": "Survey: {survey_id}",
+        "survey_status_scheduled": "scheduled",
+        "survey_status_collecting": "collecting",
+        "survey_status_pending_admin_review": "pending admin review",
+        "survey_status_blocked": "blocked",
+        "survey_status_revision_requested": "revision requested",
+        "survey_status_publishing": "publishing",
+        "survey_status_approved": "approved",
+        "survey_status_canceled": "canceled",
+        "missing_main": "main",
+        "missing_backup": "backup",
+        "review_warning_unregistered_member": "Unregistered member @{username} ({name}) was included but cannot be contacted.",
+        "review_warning_coverage_gap": "Coverage gap on {date} ({weekday}): missing {missing}; available: {available}",
+        "review_warning_main_assignment_spread": "Main assignment spread is {spread}; overloaded: {overloaded}; underloaded: {underloaded}.",
+        "availability_risk_detail": "{name} ({available}/{workdays} available)",
+        "review_warning_availability_fairness_risk": "Availability fairness risk: {details}. The bot may not be able to build a fair schedule. Use Request corrections to resend their forms, or approve if this is expected.",
+        "survey_start_delivery_failed": "Availability survey started, but these members could not be messaged:\n{members}",
+        "preview_delivery_failed": "Preview was saved for review, but delivery failed for:\n{errors}",
+        "preview_delivery_no_admin": "Preview saved but no admin could be reached: {errors}",
+        "no_admin_telegram_destinations_configured": "no admin telegram destinations configured",
+        "telegram_destination_not_configured": "Telegram group destination is not configured in SQLite. Set it with --set-telegram-group-chat-id.",
+        "configured_output_dir_not_writable": "Configured output_dir is not writable: {path}. Fix runtime_settings.output_dir to a writable path.",
+        "could_not_restart_status": "Could not restart; survey is now {status}.",
+        "could_not_cancel_status": "Could not cancel; survey is now {status}.",
+        "cannot_start_revision_status": "Cannot start revision from status {status}; expected pending admin review.",
+        "cannot_create_preview_missing_survey": "No survey found for preview ({calendar} {year}-{month}). Create and collect a survey first.",
+        "cannot_create_preview_status": "Cannot create preview from status {status} for survey {survey_id}.",
+        "debug_publish_blocked": "Debug publish to the configured production Telegram destination is blocked. Enable it in DB runtime settings with --allow-production-destination (or --set-allow-production-destination), then approve/publish again.",
+        "publish_stuck_without_receipt": "Survey {survey_id} is stuck in publishing without a confirmed Telegram delivery receipt. Check the group first, then either cancel/restart it or manually activate/finalize it with local DB commands.",
+        "preview_image_missing": "Cannot publish survey {survey_id}: preview image missing at {path}.",
+        "cannot_publish_status": "Cannot publish from status {status}.",
+        "publish_send_failed_left_publishing": "Publish send failed for survey {survey_id}; left in publishing. Do not auto-approve it; verify the group post first, then resolve it manually if needed.",
+        "failed_finalize_publish": "Failed to finalize publish for survey {survey_id} (status={status}).",
+        "daily_reminder": "Good morning {main}.\nToday is your bug day.\n\n{backup} is your backup.\nHave a good day.",
     },
     "fa": {
         "monthly_summary": "خلاصه‌ی ماهانه:",
@@ -134,9 +174,9 @@ SERVICE_TEXTS = {
         "nobody": "هیچ‌کس",
         "canceled": "برنامه‌ی {month} کنسل شد.",
         "restarted": "نظرسنجی {month} دوباره شروع شد.",
-        "correction_members": "افراد نیازمند اصلاح: {names}\nدر حالت فعلی نمی‌شود به هیچ‌کدام پیام داد. می‌توانی Reopen for everyone را بزنی یا کانفیگ اعضا را بررسی کنی.",
+        "correction_members": "افراد نیازمند اصلاح: {names}\nدر حالت فعلی نمی‌شود به هیچ‌کدام پیام داد. می‌توانی «بازکردن برای همه» را بزنی یا کانفیگ اعضا را بررسی کنی.",
         "revision_started": "پنجره‌ی اصلاح برای این افراد باز شد: {names}",
-        "revision_request": "برنامه‌ی {month} نیاز به اصلاح دارد.\nاگر روزها درست است Confirm را بزن؛ اگر اشتباه است اصلاح کن.",
+        "revision_request": "برنامه‌ی {month} نیاز به اصلاح دارد.\nاگر روزها درست است «تایید» را بزن؛ اگر اشتباه است اصلاح کن.",
         "admins_only": "فقط ادمین‌ها اجازه دارند.",
         "no_survey_action": "برای این عملیات نظرسنجی پیدا نشد.",
         "already_approved": "این برنامه قبلا تایید شده است.",
@@ -144,14 +184,50 @@ SERVICE_TEXTS = {
         "no_review": "گزارش بررسی برای اصلاح پیدا نشد.",
         "no_preview": "پیش‌نمایشی برای تایید پیدا نشد.",
         "cannot_approve_revision": "در زمان اصلاح نمی‌شود تایید کرد. اول اصلاحات را ببند.",
-        "use_change_first": "اول Change availability را بزن.",
+        "use_change_first": "اول «تغییر دسترسی» را بزن.",
         "review_report": "گزارش بررسی:",
         "needs_review": "نیازمند بررسی:",
-        "request_corrections_will_be_sent": "در صورت زدن Request corrections برای این افراد ارسال می‌شود: {names}",
+        "request_corrections_will_be_sent": "در صورت زدن «درخواست اصلاح» برای این افراد ارسال می‌شود: {names}",
         "availability_heading": "وضعیت افراد:",
         "review_member_line": "- {name}: {unavailable}/{workdays} روز نیست، {percent}٪ حاضر، {confirmed}",
         "confirmed": "تایید شده",
         "not_confirmed": "تایید نشده",
+        "temporary_telegram_error": "مشکل موقت در ارتباط با تلگرام. لطفا چند لحظه بعد دوباره تلاش کنید.",
+        "survey_label": "{month} · {survey_id} · {status}",
+        "survey_id_label": "نظرسنجی: {survey_id}",
+        "survey_status_scheduled": "زمان‌بندی شده",
+        "survey_status_collecting": "در حال جمع‌آوری",
+        "survey_status_pending_admin_review": "در انتظار بررسی ادمین",
+        "survey_status_blocked": "متوقف شده",
+        "survey_status_revision_requested": "در حال اصلاح",
+        "survey_status_publishing": "در حال انتشار",
+        "survey_status_approved": "تایید شده",
+        "survey_status_canceled": "کنسل شده",
+        "missing_main": "نفر اصلی",
+        "missing_backup": "پشتیبان",
+        "review_warning_unregistered_member": "عضو ثبت‌نشده @{username} ({name}) داخل نظرسنجی هست ولی نمی‌شود به او پیام داد.",
+        "review_warning_coverage_gap": "کمبود پوشش در {date} ({weekday}): {missing} خالی است؛ افراد در دسترس: {available}",
+        "review_warning_main_assignment_spread": "اختلاف پخش نفر اصلی {spread} است؛ پرکارترها: {overloaded}؛ کم‌کارترها: {underloaded}.",
+        "availability_risk_detail": "{name} ({available}/{workdays} روز در دسترس)",
+        "review_warning_availability_fairness_risk": "ریسک عدالت دسترسی: {details}. ممکن است بات نتواند برنامه را منصفانه بچیند. اگر لازم است درخواست اصلاح بفرست، یا اگر قابل قبول است تایید کن.",
+        "survey_start_delivery_failed": "نظرسنجی دسترسی شروع شد، ولی به این افراد نمی‌شود پیام داد:\n{members}",
+        "preview_delivery_failed": "پیش‌نمایش برای بررسی ذخیره شد، ولی ارسال به این ادمین‌ها ناموفق بود:\n{errors}",
+        "preview_delivery_no_admin": "پیش‌نمایش ذخیره شد ولی هیچ ادمینی قابل دسترس نبود: {errors}",
+        "no_admin_telegram_destinations_configured": "هیچ مقصد تلگرامی برای ادمین‌ها تنظیم نشده است",
+        "telegram_destination_not_configured": "مقصد گروه تلگرام داخل SQLite تنظیم نشده است. با --set-telegram-group-chat-id تنظیمش کن.",
+        "configured_output_dir_not_writable": "مسیر output_dir قابل نوشتن نیست: {path}. مقدار runtime_settings.output_dir را به یک مسیر قابل نوشتن تغییر بده.",
+        "could_not_restart_status": "امکان شروع دوباره نبود؛ وضعیت فعلی نظرسنجی {status} است.",
+        "could_not_cancel_status": "امکان کنسل کردن نبود؛ وضعیت فعلی نظرسنجی {status} است.",
+        "cannot_start_revision_status": "امکان شروع اصلاح از وضعیت {status} وجود ندارد؛ وضعیت مورد انتظار «در انتظار بررسی ادمین» است.",
+        "cannot_create_preview_missing_survey": "برای ساخت پیش‌نمایش نظرسنجی‌ای پیدا نشد ({calendar} {year}-{month}). اول یک نظرسنجی بساز و جمع‌آوری کن.",
+        "cannot_create_preview_status": "امکان ساخت پیش‌نمایش از وضعیت {status} برای نظرسنجی {survey_id} وجود ندارد.",
+        "debug_publish_blocked": "انتشار debug در مقصد تلگرام production فعلی مسدود است. اگر مطمئنی، در تنظیمات دیتابیس --allow-production-destination یا --set-allow-production-destination را فعال کن و دوباره تایید/منتشر کن.",
+        "publish_stuck_without_receipt": "نظرسنجی {survey_id} در وضعیت انتشار گیر کرده و رسید قطعی ارسال تلگرام ندارد. اول گروه را چک کن، بعد آن را دستی کنسل/ری‌استارت یا finalize کن.",
+        "preview_image_missing": "امکان انتشار نظرسنجی {survey_id} وجود ندارد: فایل تصویر پیش‌نمایش در مسیر {path} پیدا نشد.",
+        "cannot_publish_status": "امکان انتشار از وضعیت {status} وجود ندارد.",
+        "publish_send_failed_left_publishing": "ارسال انتشار برای نظرسنجی {survey_id} ناموفق بود و وضعیت روی publishing ماند. خودکار تاییدش نکن؛ اول پیام گروه را بررسی کن و بعد دستی حلش کن.",
+        "failed_finalize_publish": "finalize انتشار برای نظرسنجی {survey_id} ناموفق بود (status={status}).",
+        "daily_reminder": "صبح بخیر {main}.\nامروز روز باگ شماست.\n\n{backup} پشتیبان شماست.\nروز خوبی داشته باشید.",
     },
     "ar": {
         "monthly_summary": "ملخص شهري:",
@@ -176,7 +252,7 @@ SERVICE_TEXTS = {
         "nobody": "لا أحد",
         "canceled": "تم إلغاء جدول {month}.",
         "restarted": "تمت إعادة بدء استبيان {month}.",
-        "correction_members": "الأعضاء الذين يحتاجون إلى تعديل: {names}\nلا يمكن مراسلة أي منهم حاليا. استخدم Reopen for everyone أو راجع إعدادات الأعضاء.",
+        "correction_members": "الأعضاء الذين يحتاجون إلى تعديل: {names}\nلا يمكن مراسلة أي منهم حاليا. استخدم «إعادة الفتح للجميع» أو راجع إعدادات الأعضاء.",
         "revision_started": "تم فتح نافذة التعديل لـ: {names}",
         "revision_request": "جدول {month} يحتاج إلى مراجعة.\nأكد إذا كانت تواريخك صحيحة، أو عدلها.",
         "admins_only": "للمسؤولين فقط.",
@@ -194,6 +270,42 @@ SERVICE_TEXTS = {
         "review_member_line": "- {name}: غير متاح {unavailable}/{workdays}، متاح {percent}%، {confirmed}",
         "confirmed": "تم التأكيد",
         "not_confirmed": "غير مؤكد",
+        "temporary_telegram_error": "توجد مشكلة مؤقتة في Telegram. حاول مرة أخرى بعد قليل.",
+        "survey_label": "{month} · {survey_id} · {status}",
+        "survey_id_label": "الاستبيان: {survey_id}",
+        "survey_status_scheduled": "مجدول",
+        "survey_status_collecting": "قيد الجمع",
+        "survey_status_pending_admin_review": "بانتظار مراجعة المسؤول",
+        "survey_status_blocked": "متوقف",
+        "survey_status_revision_requested": "قيد التعديل",
+        "survey_status_publishing": "قيد النشر",
+        "survey_status_approved": "معتمد",
+        "survey_status_canceled": "ملغى",
+        "missing_main": "المسؤول الأساسي",
+        "missing_backup": "الاحتياطي",
+        "review_warning_unregistered_member": "العضو غير المسجل @{username} ({name}) موجود في الاستبيان لكن لا يمكن مراسلته.",
+        "review_warning_coverage_gap": "نقص تغطية في {date} ({weekday}): ينقص {missing}؛ المتاحون: {available}",
+        "review_warning_main_assignment_spread": "فرق توزيع المسؤول الأساسي هو {spread}؛ الأكثر تحميلا: {overloaded}؛ الأقل تحميلا: {underloaded}.",
+        "availability_risk_detail": "{name} ({available}/{workdays} أيام متاحة)",
+        "review_warning_availability_fairness_risk": "مخاطر عدالة التوافر: {details}. قد لا يستطيع البوت بناء جدول عادل. أرسل طلب تعديل إذا لزم، أو اعتمد إذا كان هذا متوقعا.",
+        "survey_start_delivery_failed": "بدأ استبيان التوافر، لكن تعذرت مراسلة هؤلاء الأعضاء:\n{members}",
+        "preview_delivery_failed": "تم حفظ المعاينة للمراجعة، لكن فشل الإرسال إلى:\n{errors}",
+        "preview_delivery_no_admin": "تم حفظ المعاينة لكن لا يمكن الوصول إلى أي مسؤول: {errors}",
+        "no_admin_telegram_destinations_configured": "لم يتم إعداد أي وجهة Telegram للمسؤولين",
+        "telegram_destination_not_configured": "لم يتم إعداد وجهة مجموعة Telegram في SQLite. اضبطها باستخدام --set-telegram-group-chat-id.",
+        "configured_output_dir_not_writable": "مسار output_dir غير قابل للكتابة: {path}. غيّر runtime_settings.output_dir إلى مسار قابل للكتابة.",
+        "could_not_restart_status": "تعذرت إعادة البدء؛ حالة الاستبيان الآن {status}.",
+        "could_not_cancel_status": "تعذر الإلغاء؛ حالة الاستبيان الآن {status}.",
+        "cannot_start_revision_status": "لا يمكن بدء التعديل من الحالة {status}؛ الحالة المتوقعة هي انتظار مراجعة المسؤول.",
+        "cannot_create_preview_missing_survey": "لم يتم العثور على استبيان للمعاينة ({calendar} {year}-{month}). أنشئ الاستبيان واجمع الردود أولا.",
+        "cannot_create_preview_status": "لا يمكن إنشاء معاينة من الحالة {status} للاستبيان {survey_id}.",
+        "debug_publish_blocked": "نشر debug إلى وجهة Telegram الإنتاجية الحالية محظور. فعّل --allow-production-destination أو --set-allow-production-destination في إعدادات قاعدة البيانات ثم اعتمد/انشر مرة أخرى.",
+        "publish_stuck_without_receipt": "الاستبيان {survey_id} عالق في حالة النشر بدون إيصال Telegram مؤكد. تحقق من المجموعة أولا، ثم ألغ/أعد التشغيل أو أنهه يدويا.",
+        "preview_image_missing": "لا يمكن نشر الاستبيان {survey_id}: صورة المعاينة غير موجودة في {path}.",
+        "cannot_publish_status": "لا يمكن النشر من الحالة {status}.",
+        "publish_send_failed_left_publishing": "فشل إرسال نشر الاستبيان {survey_id} وبقيت الحالة publishing. لا تعتمده تلقائيا؛ تحقق من منشور المجموعة أولا ثم عالجه يدويا.",
+        "failed_finalize_publish": "فشل إنهاء نشر الاستبيان {survey_id} (status={status}).",
+        "daily_reminder": "صباح الخير {main}.\nاليوم أنت المسؤول الأساسي عن الأخطاء.\n\n{backup} هو الاحتياطي.\nنهارك سعيد.",
     },
     "ru": {
         "monthly_summary": "Месячная сводка:",
@@ -218,7 +330,7 @@ SERVICE_TEXTS = {
         "nobody": "никто",
         "canceled": "График {month} отменен.",
         "restarted": "Опрос {month} перезапущен.",
-        "correction_members": "Участники для исправления: {names}\nСейчас никому из них нельзя отправить сообщение. Используйте Reopen for everyone или проверьте настройки участников.",
+        "correction_members": "Участники для исправления: {names}\nСейчас никому из них нельзя отправить сообщение. Используйте «Открыть для всех» или проверьте настройки участников.",
         "revision_started": "Окно исправлений открыто для: {names}",
         "revision_request": "График {month} требует проверки.\nПодтвердите, если даты верны, или измените их.",
         "admins_only": "Только для администраторов.",
@@ -228,7 +340,7 @@ SERVICE_TEXTS = {
         "no_review": "Отчет проверки для исправлений не найден.",
         "no_preview": "Превью для утверждения не найдено.",
         "cannot_approve_revision": "Нельзя утвердить во время исправлений. Сначала закройте исправления.",
-        "use_change_first": "Сначала нажмите Change availability.",
+        "use_change_first": "Сначала нажмите «Изменить доступность».",
         "review_report": "Отчет проверки:",
         "needs_review": "Нужна проверка:",
         "request_corrections_will_be_sent": "Запрос исправлений будет отправлен: {names}",
@@ -236,6 +348,42 @@ SERVICE_TEXTS = {
         "review_member_line": "- {name}: недоступен {unavailable}/{workdays}, доступен {percent}%, {confirmed}",
         "confirmed": "подтверждено",
         "not_confirmed": "не подтверждено",
+        "temporary_telegram_error": "Временная проблема с Telegram. Попробуйте еще раз через несколько секунд.",
+        "survey_label": "{month} · {survey_id} · {status}",
+        "survey_id_label": "Опрос: {survey_id}",
+        "survey_status_scheduled": "запланирован",
+        "survey_status_collecting": "идет сбор",
+        "survey_status_pending_admin_review": "ожидает проверки администратора",
+        "survey_status_blocked": "заблокирован",
+        "survey_status_revision_requested": "идут правки",
+        "survey_status_publishing": "публикуется",
+        "survey_status_approved": "утвержден",
+        "survey_status_canceled": "отменен",
+        "missing_main": "основной",
+        "missing_backup": "резерв",
+        "review_warning_unregistered_member": "Незарегистрированный участник @{username} ({name}) включен в опрос, но ему нельзя отправить сообщение.",
+        "review_warning_coverage_gap": "Пробел в покрытии {date} ({weekday}): нет {missing}; доступны: {available}",
+        "review_warning_main_assignment_spread": "Разброс основных назначений: {spread}; перегружены: {overloaded}; недогружены: {underloaded}.",
+        "availability_risk_detail": "{name} ({available}/{workdays} дней доступен)",
+        "review_warning_availability_fairness_risk": "Риск справедливости доступности: {details}. Бот может не построить справедливый график. Отправьте запрос правок или утвердите, если это ожидаемо.",
+        "survey_start_delivery_failed": "Опрос доступности начался, но этим участникам не удалось отправить сообщение:\n{members}",
+        "preview_delivery_failed": "Превью сохранено для проверки, но доставка не удалась для:\n{errors}",
+        "preview_delivery_no_admin": "Превью сохранено, но ни один администратор недоступен: {errors}",
+        "no_admin_telegram_destinations_configured": "Telegram-направления администраторов не настроены",
+        "telegram_destination_not_configured": "Группа Telegram не настроена в SQLite. Задайте ее через --set-telegram-group-chat-id.",
+        "configured_output_dir_not_writable": "output_dir недоступен для записи: {path}. Измените runtime_settings.output_dir на путь с правом записи.",
+        "could_not_restart_status": "Не удалось перезапустить; текущий статус опроса: {status}.",
+        "could_not_cancel_status": "Не удалось отменить; текущий статус опроса: {status}.",
+        "cannot_start_revision_status": "Нельзя начать правки из статуса {status}; ожидается проверка администратора.",
+        "cannot_create_preview_missing_survey": "Опрос для превью не найден ({calendar} {year}-{month}). Сначала создайте и соберите опрос.",
+        "cannot_create_preview_status": "Нельзя создать превью из статуса {status} для опроса {survey_id}.",
+        "debug_publish_blocked": "Публикация debug в текущий production Telegram-канал заблокирована. Включите --allow-production-destination или --set-allow-production-destination в настройках БД и утвердите/опубликуйте снова.",
+        "publish_stuck_without_receipt": "Опрос {survey_id} застрял в publishing без подтвержденной доставки Telegram. Сначала проверьте группу, затем отмените/перезапустите или завершите вручную.",
+        "preview_image_missing": "Нельзя опубликовать опрос {survey_id}: файл превью отсутствует по пути {path}.",
+        "cannot_publish_status": "Нельзя публиковать из статуса {status}.",
+        "publish_send_failed_left_publishing": "Отправка публикации для опроса {survey_id} не удалась; статус остался publishing. Не утверждайте автоматически; сначала проверьте пост в группе, затем решите вручную.",
+        "failed_finalize_publish": "Не удалось завершить публикацию опроса {survey_id} (status={status}).",
+        "daily_reminder": "Доброе утро, {main}.\nСегодня ваш день багов.\n\n{backup} - ваш резерв.\nХорошего дня.",
     },
 }
 
@@ -294,7 +442,6 @@ CLI_SURVEY_STATUS_TRANSITIONS: dict[str, set[str]] = {
 CLI_SETTABLE_SURVEY_STATUSES = sorted(
     {target for targets in CLI_SURVEY_STATUS_TRANSITIONS.values() for target in targets}
 )
-TEMPORARY_TELEGRAM_ERROR = "Temporary Telegram problem. Please try again in a moment."
 TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 TELEGRAM_MESSAGE_TEXT_LIMIT = 4096
 MAIN_IMBALANCE_THRESHOLD = 2
@@ -304,6 +451,87 @@ HIGH_UNAVAILABLE_RATIO = 0.35
 FAIRNESS_RISK_UNAVAILABLE_RATIO = 0.7
 NO_MAIN = "NO_AVAILABLE_PERSON"
 NO_BACKUP = "NO_AVAILABLE_BACKUP"
+
+
+def survey_status_label(
+    status: str,
+    language: str | None,
+    calendar_type: str,
+) -> str:
+    key = f"survey_status_{status}"
+    return SERVICE_TEXTS[normalize_language(language, calendar_type)].get(key, status)
+
+
+def localized_survey_label(
+    survey: Survey,
+    language: str | None,
+) -> str:
+    status = survey_status_label(survey.status, language, survey.calendar_type)
+    return service_text(
+        "survey_label",
+        language,
+        survey.calendar_type,
+        month=month_label(survey.year, survey.month, survey.calendar_type, language),
+        survey_id=survey.id,
+        status=status,
+    )
+
+
+def temporary_telegram_error_message(
+    language: str | None,
+    calendar_type: str,
+) -> str:
+    return service_text("temporary_telegram_error", language, calendar_type)
+
+
+def review_warning_text(
+    warning: dict,
+    language: str | None,
+    calendar_type: str,
+) -> str:
+    values = dict(warning.get("values") or {})
+    if "missing" in values and isinstance(values["missing"], list):
+        values["missing"] = format_names(
+            [
+                service_text(f"missing_{part}", language, calendar_type)
+                if part in {"main", "backup"}
+                else str(part)
+                for part in values["missing"]
+            ],
+            calendar_type,
+            language,
+        )
+    if "available" in values and isinstance(values["available"], list):
+        values["available"] = format_names(values["available"], calendar_type, language)
+    if "risks" in values and isinstance(values["risks"], list):
+        values["details"] = format_names(
+            [
+                service_text(
+                    "availability_risk_detail",
+                    language,
+                    calendar_type,
+                    name=item["name"],
+                    available=item["available_count"],
+                    workdays=item["workday_count"],
+                )
+                for item in values.pop("risks")
+            ],
+            calendar_type,
+            language,
+        )
+    return service_text(warning["key"], language, calendar_type, **values)
+
+
+def add_review_warning(
+    warnings: list[str],
+    warning_items: list[dict],
+    calendar_type: str,
+    key: str,
+    **values,
+) -> None:
+    warning = {"key": key, "values": values}
+    warning_items.append(warning)
+    warnings.append(review_warning_text(warning, "en", calendar_type))
 
 
 def configure_logging_from_env() -> None:
@@ -953,12 +1181,17 @@ def build_review_report(
     coverage_warnings = []
     availability_fairness_risks = []
     warnings = []
+    warning_items = []
 
     unregistered = [member for member in active if is_unregistered_member(member)]
     for member in unregistered:
-        label = f"@{normalize_username(member.username)}"
-        warnings.append(
-            f"Unregistered member {label} ({member.name}) was included but cannot be contacted."
+        add_review_warning(
+            warnings,
+            warning_items,
+            calendar_type,
+            "review_warning_unregistered_member",
+            username=normalize_username(member.username),
+            name=member.name,
         )
 
     for item in schedule:
@@ -992,11 +1225,15 @@ def build_review_report(
                 "unavailable": unavailable,
             }
         )
-        warnings.append(
-            "Coverage gap on "
-            f"{item['date']} ({item['weekday']}): missing "
-            f"{' and '.join(missing_parts)}; available: "
-            f"{', '.join(available) or 'nobody'}"
+        add_review_warning(
+            warnings,
+            warning_items,
+            calendar_type,
+            "review_warning_coverage_gap",
+            date=item["date"],
+            weekday=item["weekday"],
+            missing=missing_parts,
+            available=sorted(available),
         )
 
     plain_stats = stats_to_plain_dict(stats)
@@ -1011,10 +1248,14 @@ def build_review_report(
         underloaded = [
             name for name, values in plain_stats.items() if values["main_count"] == min_main
         ]
-        warnings.append(
-            "Main assignment spread is "
-            f"{main_spread}; overloaded: {', '.join(sorted(overloaded))}; "
-            f"underloaded: {', '.join(sorted(underloaded))}."
+        add_review_warning(
+            warnings,
+            warning_items,
+            calendar_type,
+            "review_warning_main_assignment_spread",
+            spread=main_spread,
+            overloaded=format_names(sorted(overloaded), calendar_type, "en"),
+            underloaded=format_names(sorted(underloaded), calendar_type, "en"),
         )
 
     availability = [
@@ -1066,14 +1307,12 @@ def build_review_report(
                 flagged_member_ids.add(item["telegram_id"])
 
     if availability_fairness_risks:
-        details = ", ".join(
-            f"{item['name']} ({item['available_count']}/{item['workday_count']} available)"
-            for item in availability_fairness_risks
-        )
-        warnings.append(
-            "Availability fairness risk: "
-            f"{details}. The bot may not be able to build a fair schedule. "
-            "Use Request corrections to resend their forms, or approve if this is expected."
+        add_review_warning(
+            warnings,
+            warning_items,
+            calendar_type,
+            "review_warning_availability_fairness_risk",
+            risks=availability_fairness_risks,
         )
 
     status = "needs_review" if warnings else "ready"
@@ -1083,6 +1322,7 @@ def build_review_report(
         "coverage_warnings": coverage_warnings,
         "availability_fairness_risks": availability_fairness_risks,
         "warnings": warnings,
+        "warning_items": warning_items,
         "flagged_member_ids": sorted(flagged_member_ids),
         "flagged_member_names": [
             member_by_id[member_id].name
@@ -1101,7 +1341,14 @@ def review_text(review: dict, calendar_type: str, language: str | None = None) -
     lines = [service_text("review_report", lang, calendar_type)]
     if review.get("warnings"):
         lines.append(service_text("needs_review", lang, calendar_type))
-        lines.extend(f"- {warning}" for warning in review["warnings"])
+        warning_items = review.get("warning_items") or []
+        if warning_items:
+            lines.extend(
+                f"- {review_warning_text(warning, lang, calendar_type)}"
+                for warning in warning_items
+            )
+        else:
+            lines.extend(f"- {warning}" for warning in review["warnings"])
     if review.get("flagged_member_names"):
         lines.append(
             service_text(
@@ -1149,8 +1396,15 @@ def summary_text(stats: dict, calendar_type: str, language: str | None = None) -
     return "\n".join(lines)
 
 
-def month_label(year: int, month: int, calendar_type: str) -> str:
-    return format_month_title(year, month, calendar_type)
+def month_label(
+    year: int,
+    month: int,
+    calendar_type: str,
+    language: str | None = None,
+) -> str:
+    if language is None:
+        return format_month_title(year, month, calendar_type)
+    return localized_month_title(year, month, calendar_type, language)
 
 
 def group_schedule_caption(
@@ -1163,7 +1417,7 @@ def group_schedule_caption(
         "schedule_caption",
         language,
         calendar_type,
-        month=month_label(year, month, calendar_type),
+        month=month_label(year, month, calendar_type, language),
     )
 
 
@@ -1177,7 +1431,7 @@ def approval_sent_message(
         "approval_sent",
         language,
         calendar_type,
-        month=month_label(year, month, calendar_type),
+        month=month_label(year, month, calendar_type, language),
     )
 
 
@@ -1192,7 +1446,7 @@ def approval_posted_pin_failed_message(
         "approval_pin_failed",
         language,
         calendar_type,
-        month=month_label(year, month, calendar_type),
+        month=month_label(year, month, calendar_type, language),
         error=error,
     )
 
@@ -1210,7 +1464,7 @@ def preview_photo_caption(
         "preview_caption",
         language,
         calendar_type,
-        month=month_label(year, month, calendar_type),
+        month=month_label(year, month, calendar_type, language),
         status=status,
     )
     return caption[:TELEGRAM_PHOTO_CAPTION_LIMIT]
@@ -1228,7 +1482,7 @@ def preview_report_message(
         "preview_report_title",
         language,
         calendar_type,
-        month=month_label(year, month, calendar_type),
+        month=month_label(year, month, calendar_type, language),
     )
     return (
         f"{title}\n\n"
@@ -1285,7 +1539,7 @@ def assignment_summary_message(
             "schedule_live",
             language,
             survey.calendar_type,
-            month=month_label(survey.year, survey.month, survey.calendar_type),
+            month=month_label(survey.year, survey.month, survey.calendar_type, language),
         ),
         service_text("main_days", language, survey.calendar_type, count=len(main_days)),
     ]
@@ -1567,8 +1821,11 @@ class AdhocTelegramBot:
         destination = self.repo.get_telegram_destination()
         if not destination:
             raise RuntimeError(
-                "Telegram group destination is not configured in SQLite. "
-                "Set it with --set-telegram-group-chat-id."
+                service_text(
+                    "telegram_destination_not_configured",
+                    self.language,
+                    self.calendar_type,
+                )
             )
         return destination["group_chat_id"], destination["topic_id"]
 
@@ -1584,10 +1841,7 @@ class AdhocTelegramBot:
         return effective
 
     def survey_label(self, survey: Survey) -> str:
-        return (
-            f"{month_label(survey.year, survey.month, survey.calendar_type)}"
-            f" · {survey.id} · {survey.status}"
-        )
+        return localized_survey_label(survey, self.language)
 
     def survey_form_text(self, survey: Survey, response: AvailabilityResponse) -> str:
         return availability_summary(
@@ -1763,7 +2017,12 @@ class AdhocTelegramBot:
             current = self.repo.get_survey(survey.id)
             status = current.status if current else "unknown"
             raise RuntimeError(
-                f"Cannot start revision from status {status}; expected pending_admin_review."
+                service_text(
+                    "cannot_start_revision_status",
+                    self.language,
+                    survey.calendar_type,
+                    status=survey_status_label(status, self.language, survey.calendar_type),
+                )
             )
         survey = self.repo.get_survey(survey.id) or survey
         allowed = sorted(set(member_ids))
@@ -1967,9 +2226,11 @@ class AdhocTelegramBot:
             state.get("collect_until") or "month-start/all-responses",
         )
         if failed_members:
-            message = (
-                "Availability survey started, but these members could not be messaged:\n"
-                + "\n".join(failed_members)
+            message = service_text(
+                "survey_start_delivery_failed",
+                self.language,
+                survey.calendar_type,
+                members="\n".join(failed_members),
             )
             for admin_id in self.admin_telegram_ids():
                 self.telegram.send_message(admin_id, message)
@@ -2687,7 +2948,10 @@ class AdhocTelegramBot:
                 log_step("clear_member_edit_override")
         except Exception as exc:
             logger.warning("Availability save failed for %s: %s", member.name, exc)
-            self.safe_answer_callback_query(callback["id"], TEMPORARY_TELEGRAM_ERROR)
+            self.safe_answer_callback_query(
+                callback["id"],
+                temporary_telegram_error_message(self.language, survey.calendar_type),
+            )
             log_step("persist_response_failed")
             return
 
@@ -2767,7 +3031,10 @@ class AdhocTelegramBot:
                             self.language,
                         )
                         if action in save_like_actions
-                        else TEMPORARY_TELEGRAM_ERROR
+                        else temporary_telegram_error_message(
+                            self.language,
+                            survey.calendar_type,
+                        )
                     ),
                 )
                 log_step("telegram_callback_failed", final_confirm=is_final_confirm)
@@ -2965,8 +3232,14 @@ class AdhocTelegramBot:
         survey = self.repo.get_survey(survey_id) if survey_id else self.active_or_latest_survey_for_month(year, month)
         if survey is None:
             raise RuntimeError(
-                f"No survey found for preview ({self.calendar_type} {year}-{month:02d}). "
-                "Create and collect a survey first."
+                service_text(
+                    "cannot_create_preview_missing_survey",
+                    self.language,
+                    self.calendar_type,
+                    calendar=self.calendar_type,
+                    year=year,
+                    month=f"{month:02d}",
+                )
             )
         base_config = {
             "calendar": survey.calendar_type,
@@ -3032,6 +3305,7 @@ class AdhocTelegramBot:
             survey.calendar_type,
             image_path,
             stats=stats,
+            language=self.language,
         )
 
         caption = preview_photo_caption(
@@ -3072,8 +3346,17 @@ class AdhocTelegramBot:
         ):
             current = self.repo.get_survey(survey.id)
             raise RuntimeError(
-                f"Cannot create preview from status "
-                f"{current.status if current else 'missing'} for survey {survey.id}."
+                service_text(
+                    "cannot_create_preview_status",
+                    self.language,
+                    survey.calendar_type,
+                    status=survey_status_label(
+                        current.status if current else "missing",
+                        self.language,
+                        survey.calendar_type,
+                    ),
+                    survey_id=survey.id,
+                )
             )
         survey = self.repo.get_survey(survey.id) or survey
         # Preview ends any revision window; allowlist is no longer needed.
@@ -3083,7 +3366,13 @@ class AdhocTelegramBot:
         delivered_admin_ids: list[int] = []
         admin_ids = self.admin_telegram_ids()
         if not admin_ids:
-            failed_admins.append("no admin telegram destinations configured")
+            failed_admins.append(
+                service_text(
+                    "no_admin_telegram_destinations_configured",
+                    self.language,
+                    survey.calendar_type,
+                )
+            )
         for admin_id in admin_ids:
             try:
                 self.telegram.send_photo(
@@ -3099,15 +3388,20 @@ class AdhocTelegramBot:
                 failed_admins.append(f"{admin_id}: {exc}")
 
         if failed_admins and delivered_admin_ids:
-            failure_text = (
-                "Preview was saved for review, but delivery failed for:\n"
-                + "\n".join(failed_admins)
+            failure_text = service_text(
+                "preview_delivery_failed",
+                self.language,
+                survey.calendar_type,
+                errors="\n".join(failed_admins),
             )
             for admin_id in delivered_admin_ids:
                 self.safe_send_message(admin_id, failure_text)
         elif failed_admins and not delivered_admin_ids:
-            delivery_note = (
-                "Preview saved but no admin could be reached: " + "; ".join(failed_admins)
+            delivery_note = service_text(
+                "preview_delivery_no_admin",
+                self.language,
+                survey.calendar_type,
+                errors="; ".join(failed_admins),
             )
             logger.error("Preview for survey %s: %s", survey.id, delivery_note)
             review_payload = dict(review)
@@ -3117,6 +3411,14 @@ class AdhocTelegramBot:
             if delivery_note not in warnings:
                 warnings.append(delivery_note)
             review_payload["warnings"] = warnings
+            warning_items = list(review_payload.get("warning_items") or [])
+            warning_items.append(
+                {
+                    "key": "preview_delivery_no_admin",
+                    "values": {"errors": "; ".join(failed_admins)},
+                }
+            )
+            review_payload["warning_items"] = warning_items
             review_payload["status"] = "needs_review"
             self.repo.update_survey(survey.id, review_json=json.dumps(review_payload))
 
@@ -3126,8 +3428,12 @@ class AdhocTelegramBot:
             return self.ensure_writable_dir(configured)
         except OSError as exc:
             raise RuntimeError(
-                f"Configured output_dir is not writable: {configured}. "
-                "Fix runtime_settings.output_dir to a writable path."
+                service_text(
+                    "configured_output_dir_not_writable",
+                    self.language,
+                    self.calendar_type,
+                    path=configured,
+                )
             ) from exc
 
     def ensure_writable_dir(self, path: Path) -> Path:
@@ -3217,8 +3523,16 @@ class AdhocTelegramBot:
                     current = self.repo.get_survey(survey.id)
                     self.safe_send_message(
                         user_id,
-                        f"Could not restart; survey is now "
-                        f"{current.status if current else 'missing'}.",
+                        service_text(
+                            "could_not_restart_status",
+                            self.language,
+                            calendar_type,
+                            status=survey_status_label(
+                                current.status if current else "missing",
+                                self.language,
+                                calendar_type,
+                            ),
+                        ),
                     )
                     return
             new_survey = self.create_survey_record(
@@ -3235,7 +3549,17 @@ class AdhocTelegramBot:
             self.remove_callback_buttons(callback)
             self.safe_send_message(
                 user_id,
-                f"{self.survey_restarted_message(year, month, calendar_type)}\nSurvey: {new_survey.id}",
+                "\n".join(
+                    [
+                        self.survey_restarted_message(year, month, calendar_type),
+                        service_text(
+                            "survey_id_label",
+                            self.language,
+                            calendar_type,
+                            survey_id=new_survey.id,
+                        ),
+                    ]
+                ),
             )
             return
 
@@ -3245,7 +3569,10 @@ class AdhocTelegramBot:
                 self.remove_callback_buttons(callback)
             except TelegramApiError as exc:
                 logger.warning("Closing revision failed for %s/%s: %s", year, month, exc)
-                self.safe_send_message(user_id, TEMPORARY_TELEGRAM_ERROR)
+                self.safe_send_message(
+                    user_id,
+                    temporary_telegram_error_message(self.language, calendar_type),
+                )
             except RuntimeError as exc:
                 self.safe_send_message(user_id, str(exc))
             return
@@ -3256,7 +3583,10 @@ class AdhocTelegramBot:
                 self.remove_callback_buttons(callback)
             except TelegramApiError as exc:
                 logger.warning("Preview regeneration failed for %s/%s: %s", year, month, exc)
-                self.safe_send_message(user_id, TEMPORARY_TELEGRAM_ERROR)
+                self.safe_send_message(
+                    user_id,
+                    temporary_telegram_error_message(self.language, calendar_type),
+                )
             except RuntimeError as exc:
                 self.safe_send_message(user_id, str(exc))
             return
@@ -3276,7 +3606,16 @@ class AdhocTelegramBot:
                 current = self.repo.get_survey(survey.id)
                 self.safe_send_message(
                     user_id,
-                    f"Could not cancel; survey is now {current.status if current else 'missing'}.",
+                    service_text(
+                        "could_not_cancel_status",
+                        self.language,
+                        calendar_type,
+                        status=survey_status_label(
+                            current.status if current else "missing",
+                            self.language,
+                            calendar_type,
+                        ),
+                    ),
                 )
                 return
             self.repo.clear_active_survey_phase(survey.kind)
@@ -3388,7 +3727,10 @@ class AdhocTelegramBot:
             self.safe_send_message(user_id, admin_message)
         except TelegramApiError as exc:
             logger.warning("Posting approved schedule failed for %s/%s: %s", year, month, exc)
-            self.safe_send_message(user_id, TEMPORARY_TELEGRAM_ERROR)
+            self.safe_send_message(
+                user_id,
+                temporary_telegram_error_message(self.language, calendar_type),
+            )
         except RuntimeError as exc:
             logger.warning("Posting approved schedule failed for %s/%s: %s", year, month, exc)
             self.safe_send_message(user_id, str(exc))
@@ -3400,9 +3742,11 @@ class AdhocTelegramBot:
         if self.runtime.allow_production_destination:
             return
         raise RuntimeError(
-            "Debug publish to the configured production Telegram destination is blocked. "
-            "Enable it in DB runtime settings with --allow-production-destination "
-            "(or --set-allow-production-destination), then approve/publish again."
+            service_text(
+                "debug_publish_blocked",
+                self.language,
+                survey.calendar_type,
+            )
         )
 
     def finalize_published_survey(self, survey: Survey) -> None:
@@ -3416,8 +3760,17 @@ class AdhocTelegramBot:
             current = self.repo.get_survey(survey.id)
             if current is None or current.status != STATUS_APPROVED:
                 raise RuntimeError(
-                    f"Failed to finalize publish for survey {survey.id} "
-                    f"(status={current.status if current else 'missing'})."
+                    service_text(
+                        "failed_finalize_publish",
+                        self.language,
+                        survey.calendar_type,
+                        survey_id=survey.id,
+                        status=survey_status_label(
+                            current.status if current else "missing",
+                            self.language,
+                            survey.calendar_type,
+                        ),
+                    )
                 )
 
     def notify_members_schedule_published(self, survey: Survey) -> None:
@@ -3447,13 +3800,15 @@ class AdhocTelegramBot:
     def publish_survey(self, survey: Survey) -> TelegramApiError | None:
         """Post survey schedule to the configured group and mark approved."""
         if not survey.schedule_json:
-            raise RuntimeError("No preview found for approval.")
+            raise RuntimeError(service_text("no_preview", self.language, survey.calendar_type))
         if survey.status == STATUS_APPROVED:
-            raise RuntimeError("This schedule is already approved.")
+            raise RuntimeError(service_text("already_approved", self.language, survey.calendar_type))
         if survey.status == STATUS_CANCELED:
-            raise RuntimeError("This schedule was canceled.")
+            raise RuntimeError(service_text("was_canceled", self.language, survey.calendar_type))
         if survey.status == STATUS_REVISION_REQUESTED:
-            raise RuntimeError("Cannot approve while revision is in progress.")
+            raise RuntimeError(
+                service_text("cannot_approve_revision", self.language, survey.calendar_type)
+            )
 
         self.ensure_debug_publish_destination_allowed(survey)
 
@@ -3462,9 +3817,12 @@ class AdhocTelegramBot:
                 self.finalize_published_survey(survey)
                 return None
             raise RuntimeError(
-                f"Survey {survey.id} is stuck in publishing without a confirmed Telegram "
-                "delivery receipt. Check the group first, then either cancel/restart it or "
-                "manually activate/finalize it with local DB commands."
+                service_text(
+                    "publish_stuck_without_receipt",
+                    self.language,
+                    survey.calendar_type,
+                    survey_id=survey.id,
+                )
             )
 
         # Validate destination and image before claiming publishing — avoid wedging
@@ -3473,7 +3831,13 @@ class AdhocTelegramBot:
         image_path = Path(survey.image_path or "")
         if not image_path.is_file():
             raise RuntimeError(
-                f"Cannot publish survey {survey.id}: preview image missing at {image_path}."
+                service_text(
+                    "preview_image_missing",
+                    self.language,
+                    survey.calendar_type,
+                    survey_id=survey.id,
+                    path=image_path,
+                )
             )
 
         if not self.repo.transition_survey(
@@ -3483,7 +3847,16 @@ class AdhocTelegramBot:
         ):
             current = self.repo.get_survey(survey.id)
             raise RuntimeError(
-                f"Cannot publish from status {current.status if current else 'missing'}."
+                service_text(
+                    "cannot_publish_status",
+                    self.language,
+                    survey.calendar_type,
+                    status=survey_status_label(
+                        current.status if current else "missing",
+                        self.language,
+                        survey.calendar_type,
+                    ),
+                )
             )
 
         caption = group_schedule_caption(
@@ -3509,9 +3882,12 @@ class AdhocTelegramBot:
                 exc,
             )
             raise RuntimeError(
-                f"Publish send failed for survey {survey.id}; left in publishing. "
-                "Do not auto-approve it; verify the group post first, then resolve it manually "
-                "if needed."
+                service_text(
+                    "publish_send_failed_left_publishing",
+                    self.language,
+                    survey.calendar_type,
+                    survey_id=survey.id,
+                )
             ) from exc
 
         self.repo.update_survey(survey.id, group_sent_at=utc_now())
@@ -3531,7 +3907,7 @@ class AdhocTelegramBot:
             "canceled",
             self.language,
             calendar_type,
-            month=month_label(year, month, calendar_type),
+            month=month_label(year, month, calendar_type, self.language),
         )
 
     def survey_restarted_message(self, year: int, month: int, calendar_type: str) -> str:
@@ -3539,7 +3915,7 @@ class AdhocTelegramBot:
             "restarted",
             self.language,
             calendar_type,
-            month=month_label(year, month, calendar_type),
+            month=month_label(year, month, calendar_type, self.language),
         )
 
     def no_reachable_flagged_members_message(self, flagged_names: list[str]) -> str:
@@ -3599,7 +3975,7 @@ class AdhocTelegramBot:
             "revision_request",
             self.language,
             self.calendar_type,
-            month=month_label(year, month, self.calendar_type),
+            month=month_label(year, month, self.calendar_type, self.language),
         )
 
     def send_daily_reminder(self, now: datetime | None = None) -> None:
@@ -3637,11 +4013,12 @@ class AdhocTelegramBot:
         self.telegram.send_message(
             chat_id=group_chat_id,
             message_thread_id=topic_id,
-            text=(
-                f"Good morning {main_text}.\n"
-                "Today is your bug day.\n\n"
-                f"{backup_text} is your backup.\n"
-                "Have a good day."
+            text=service_text(
+                "daily_reminder",
+                self.language,
+                self.calendar_type,
+                main=main_text,
+                backup=backup_text,
             ),
         )
         self.repo.mark_daily_sent(work_date)

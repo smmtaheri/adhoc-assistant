@@ -57,7 +57,7 @@ def default_bot_messages(language: str | None, calendar: str = "gregorian") -> d
             "not_active_member": "شما در لیست اعضای فعال نیستید.",
             "no_active_survey": "در حال حاضر نظرسنجی فعالی وجود ندارد.",
             "survey_closed": (
-                "مهلت ثبت availability تمام شده است. "
+                "مهلت ثبت دسترسی تمام شده است. "
                 "اگر نیاز به اصلاح داری با ادمین هماهنگ کن."
             ),
             "survey_ended": "این نظرسنجی به پایان رسیده است.",

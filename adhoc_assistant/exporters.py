@@ -15,6 +15,7 @@ from .constants import (
     PERSIAN_WEEKDAY_NAMES,
     WEEKDAY_NAMES,
 )
+from .telegram_bot.messages import normalize_language
 
 
 DAY_PALETTE = [
@@ -27,10 +28,230 @@ DAY_PALETTE = [
 ]
 
 
-def calendar_weekday_names(calendar_type: str) -> dict[int, str]:
+GREGORIAN_MONTH_NAMES_BY_LANGUAGE = {
+    "en": {
+        1: "January",
+        2: "February",
+        3: "March",
+        4: "April",
+        5: "May",
+        6: "June",
+        7: "July",
+        8: "August",
+        9: "September",
+        10: "October",
+        11: "November",
+        12: "December",
+    },
+    "fa": {
+        1: "ژانویه",
+        2: "فوریه",
+        3: "مارس",
+        4: "آوریل",
+        5: "مه",
+        6: "ژوئن",
+        7: "ژوئیه",
+        8: "اوت",
+        9: "سپتامبر",
+        10: "اکتبر",
+        11: "نوامبر",
+        12: "دسامبر",
+    },
+    "ar": {
+        1: "يناير",
+        2: "فبراير",
+        3: "مارس",
+        4: "أبريل",
+        5: "مايو",
+        6: "يونيو",
+        7: "يوليو",
+        8: "أغسطس",
+        9: "سبتمبر",
+        10: "أكتوبر",
+        11: "نوفمبر",
+        12: "ديسمبر",
+    },
+    "ru": {
+        1: "Январь",
+        2: "Февраль",
+        3: "Март",
+        4: "Апрель",
+        5: "Май",
+        6: "Июнь",
+        7: "Июль",
+        8: "Август",
+        9: "Сентябрь",
+        10: "Октябрь",
+        11: "Ноябрь",
+        12: "Декабрь",
+    },
+}
+
+JALALI_MONTH_NAMES_BY_LANGUAGE = {
+    "en": {
+        1: "Farvardin",
+        2: "Ordibehesht",
+        3: "Khordad",
+        4: "Tir",
+        5: "Mordad",
+        6: "Shahrivar",
+        7: "Mehr",
+        8: "Aban",
+        9: "Azar",
+        10: "Dey",
+        11: "Bahman",
+        12: "Esfand",
+    },
+    "fa": {
+        1: "فروردین",
+        2: "اردیبهشت",
+        3: "خرداد",
+        4: "تیر",
+        5: "مرداد",
+        6: "شهریور",
+        7: "مهر",
+        8: "آبان",
+        9: "آذر",
+        10: "دی",
+        11: "بهمن",
+        12: "اسفند",
+    },
+    "ar": {
+        1: "فروردين",
+        2: "أرديبهشت",
+        3: "خرداد",
+        4: "تير",
+        5: "مرداد",
+        6: "شهريور",
+        7: "مهر",
+        8: "آبان",
+        9: "آذر",
+        10: "دي",
+        11: "بهمن",
+        12: "إسفند",
+    },
+    "ru": {
+        1: "Фарвардин",
+        2: "Ордибехешт",
+        3: "Хордад",
+        4: "Тир",
+        5: "Мордад",
+        6: "Шахривар",
+        7: "Мехр",
+        8: "Абан",
+        9: "Азар",
+        10: "Дей",
+        11: "Бахман",
+        12: "Эсфанд",
+    },
+}
+
+WEEKDAY_NAMES_BY_LANGUAGE = {
+    "en": WEEKDAY_NAMES,
+    "fa": PERSIAN_WEEKDAY_NAMES,
+    "ar": {
+        0: "الاثنين",
+        1: "الثلاثاء",
+        2: "الأربعاء",
+        3: "الخميس",
+        4: "الجمعة",
+        5: "السبت",
+        6: "الأحد",
+    },
+    "ru": {
+        0: "Понедельник",
+        1: "Вторник",
+        2: "Среда",
+        3: "Четверг",
+        4: "Пятница",
+        5: "Суббота",
+        6: "Воскресенье",
+    },
+}
+
+IMAGE_TEXTS = {
+    "en": {
+        "title": "Adhoc Schedule - {month}",
+        "summary_title": "Monthly summary",
+        "main": "Bug Day",
+        "backup": "Helper",
+        "total": "Total",
+        "subtitle": "Team calendar from Saturday through Thursday.",
+    },
+    "fa": {
+        "title": "برنامه ادهاک {month}",
+        "summary_title": "آمار ماهانه",
+        "main": "روز باگ",
+        "backup": "پشتیبان",
+        "total": "کل",
+        "subtitle": "تقویم تیم از شنبه تا پنجشنبه.",
+    },
+    "ar": {
+        "title": "جدول Adhoc - {month}",
+        "summary_title": "الملخص الشهري",
+        "main": "المسؤول الأساسي",
+        "backup": "الاحتياطي",
+        "total": "المجموع",
+        "subtitle": "تقويم الفريق من السبت إلى الخميس.",
+    },
+    "ru": {
+        "title": "График Adhoc - {month}",
+        "summary_title": "Месячная сводка",
+        "main": "Основной",
+        "backup": "Резерв",
+        "total": "Всего",
+        "subtitle": "Календарь команды с субботы по четверг.",
+    },
+}
+
+
+def legacy_default_language_for_calendar(calendar_type: str) -> str:
+    return "fa" if calendar_type == "jalali" else "en"
+
+
+def export_language(language: str | None, calendar_type: str) -> str:
+    if language is None:
+        return legacy_default_language_for_calendar(calendar_type)
+    return normalize_language(language, calendar_type)
+
+
+def text_direction(language: str) -> str:
+    return "rtl" if language in {"fa", "ar"} else "ltr"
+
+
+def localized_year(year: int, language: str) -> str:
+    if language == "fa":
+        return str(year).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+    if language == "ar":
+        return str(year).translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
+    return str(year)
+
+
+def localized_month_title(
+    year: int,
+    month: int,
+    calendar_type: str,
+    language: str | None = None,
+) -> str:
+    lang = export_language(language, calendar_type)
     if calendar_type == "jalali":
+        month_name = JALALI_MONTH_NAMES_BY_LANGUAGE[lang][month]
+    else:
+        month_name = GREGORIAN_MONTH_NAMES_BY_LANGUAGE[lang][month]
+    year_label = localized_year(year, lang)
+    if lang == "fa" and calendar_type == "jalali":
+        return f"{month_name}ماه {year_label}"
+    return f"{month_name} {year_label}"
+
+
+def calendar_weekday_names(
+    calendar_type: str,
+    language: str | None = None,
+) -> dict[int, str]:
+    if language is None and calendar_type == "jalali":
         return PERSIAN_WEEKDAY_NAMES
-    return WEEKDAY_NAMES
+    lang = export_language(language, calendar_type)
+    return WEEKDAY_NAMES_BY_LANGUAGE[lang]
 
 
 def visual_weekdays(calendar_type: str) -> list[int]:
@@ -185,11 +406,14 @@ def export_html_calendar(
     month: int,
     calendar_type: str,
     output_path: Path,
+    language: str | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    lang = export_language(language, calendar_type)
+    direction = text_direction(lang)
     weekdays = visual_weekdays(calendar_type)
     rows = build_calendar_rows(schedule, calendar_type)
-    weekday_names = calendar_weekday_names(calendar_type)
+    weekday_names = calendar_weekday_names(calendar_type, lang)
     weekday_headers = "\n".join(
         f"<div class=\"weekday-heading\">{html.escape(weekday_names[index])}</div>"
         for index in weekdays
@@ -202,17 +426,12 @@ def export_html_calendar(
         """
         for row in rows
     )
-    title = html.escape(f"Bug Day Schedule - {format_month_title(year, month, calendar_type)}")
-    html_lang = "fa" if calendar_type == "jalali" else "en"
-    html_dir = "rtl" if calendar_type == "jalali" else "ltr"
-    subtitle = (
-        "تقویم تیم از شنبه تا پنجشنبه."
-        if calendar_type == "jalali"
-        else "Team calendar from Saturday through Thursday."
-    )
+    month_title = localized_month_title(year, month, calendar_type, lang)
+    title = html.escape(IMAGE_TEXTS[lang]["title"].format(month=month_title))
+    subtitle = IMAGE_TEXTS[lang]["subtitle"]
 
     document = f"""<!doctype html>
-<html lang="{html_lang}" dir="{html_dir}">
+<html lang="{lang}" dir="{direction}">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -542,9 +761,18 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
 
 
 def svg_title(year: int, month: int, calendar_type: str) -> str:
-    if calendar_type == "jalali":
-        return f"برنامه ادهاک {format_month_title(year, month, calendar_type)}"
-    return f"Adhoc Schedule - {format_month_title(year, month, calendar_type)}"
+    return svg_title_for_language(year, month, calendar_type)
+
+
+def svg_title_for_language(
+    year: int,
+    month: int,
+    calendar_type: str,
+    language: str | None = None,
+) -> str:
+    lang = export_language(language, calendar_type)
+    month_title = localized_month_title(year, month, calendar_type, lang)
+    return IMAGE_TEXTS[lang]["title"].format(month=month_title)
 
 
 def summary_values(stats: dict | None) -> list[tuple[str, dict]]:
@@ -595,25 +823,27 @@ def render_svg_summary(
     left: int,
     start_y: int,
     width: int,
+    language: str | None = None,
 ) -> tuple[str, int]:
     rows = summary_values(stats)
     if not rows:
         return "", 0
 
-    if calendar_type == "jalali":
-        title = "آمار ماهانه"
-        labels = ("روز باگ", "پشتیبان", "کل")
-        direction = "rtl"
-        anchor = "start"
+    lang = export_language(language, calendar_type)
+    direction = text_direction(lang)
+    labels = (
+        IMAGE_TEXTS[lang]["main"],
+        IMAGE_TEXTS[lang]["backup"],
+        IMAGE_TEXTS[lang]["total"],
+    )
+    title = IMAGE_TEXTS[lang]["summary_title"]
+    anchor = "start"
+    if direction == "rtl":
         safe_inset = 96
         title_x = width - left - safe_inset
         name_x = width - left - 18 - safe_inset
         value_columns = (left + 150, left + 290, left + 430)
     else:
-        title = "Monthly summary"
-        labels = ("Bug Day", "Helper", "Total")
-        direction = "ltr"
-        anchor = "start"
         title_x = left
         name_x = left + 18
         value_columns = (width - left - 430, width - left - 290, width - left - 150)
@@ -667,9 +897,10 @@ def export_image_calendar(
     calendar_type: str,
     output_path: Path,
     stats: dict | None = None,
+    language: str | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    svg = build_calendar_svg(schedule, year, month, calendar_type, stats)
+    svg = build_calendar_svg(schedule, year, month, calendar_type, stats, language)
     if output_path.suffix.lower() in {".jpg", ".jpeg"}:
         write_svg_as_jpg(svg, output_path)
         return
@@ -691,14 +922,17 @@ def build_calendar_svg(
     month: int,
     calendar_type: str,
     stats: dict | None = None,
+    language: str | None = None,
 ) -> str:
+    lang = export_language(language, calendar_type)
+    direction = text_direction(lang)
     weekdays = visual_weekdays(calendar_type)
     rows = build_calendar_rows(schedule, calendar_type)
-    weekday_names = calendar_weekday_names(calendar_type)
+    weekday_names = calendar_weekday_names(calendar_type, lang)
     cell_width = 198
     cell_height = 174
     gap = 12
-    rtl_canvas_gutter = 480 if calendar_type == "jalali" else 0
+    rtl_canvas_gutter = 480 if direction == "rtl" else 0
     rtl_content_shift = rtl_canvas_gutter // 2
     left = 40 + rtl_content_shift
     top = 150
@@ -711,13 +945,14 @@ def build_calendar_svg(
         left=left,
         start_y=top + calendar_height + 28,
         width=width,
+        language=lang,
     )
     height = top + calendar_height + 48 + summary_height
-    title = html.escape(svg_title(year, month, calendar_type))
-    rtl_safe_inset = 96 if calendar_type == "jalali" else 0
-    title_x = width - left - rtl_safe_inset if calendar_type == "jalali" else left
+    title = html.escape(svg_title_for_language(year, month, calendar_type, lang))
+    rtl_safe_inset = 96 if direction == "rtl" else 0
+    title_x = width - left - rtl_safe_inset if direction == "rtl" else left
     title_anchor = "start"
-    title_direction = "rtl" if calendar_type == "jalali" else "ltr"
+    title_direction = direction
 
     weekday_labels = []
     for index, weekday in enumerate(weekdays):
