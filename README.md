@@ -161,6 +161,16 @@ There is no `bot_config.toml`. Missing or incomplete `runtime_settings` makes th
 
 ### Users and admins
 
+Send a custom text message to the configured Telegram group or topic:
+
+```bash
+uv run python -m adhoc_assistant.telegram_bot \
+  --send-group-message "متن پیام سفارشی"
+```
+
+The command uses the group chat and optional topic configured in
+`telegram_destination`.
+
 ```bash
 uv run python -m adhoc_assistant.telegram_bot \
   --upsert-user some_admin_username \

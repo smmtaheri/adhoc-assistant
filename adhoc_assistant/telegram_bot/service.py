@@ -5033,6 +5033,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print DB-backed runtime settings such as Telegram destination.",
     )
     parser.add_argument(
+        "--send-group-message",
+        help="Send a custom text message to the configured Telegram group/topic, then exit.",
+    )
+    parser.add_argument(
         "--cleanup-telegram-updates",
         action="store_true",
         help="Delete old terminal telegram_update_tracking rows, then exit.",
@@ -5125,6 +5129,38 @@ def handle_local_db_command(
 ) -> bool:
     if args.show_runtime_settings:
         print_runtime_settings(repo)
+        return True
+
+    custom_message = getattr(args, "send_group_message", None)
+    if custom_message is not None:
+        if not custom_message.strip():
+            raise SystemExit("--send-group-message must not be empty.")
+
+        runtime = repo.get_runtime_settings()
+        if not runtime.telegram_token:
+            raise SystemExit(
+                "telegram_token is empty in runtime_settings. Use --set-telegram-token."
+            )
+        destination = repo.get_telegram_destination()
+        if not destination:
+            raise SystemExit(
+                "Telegram destination is not configured. "
+                "Use --set-telegram-group-chat-id."
+            )
+
+        telegram = TelegramClient(runtime.telegram_token)
+        response = telegram.send_message(
+            chat_id=destination["group_chat_id"],
+            text=custom_message,
+            message_thread_id=destination["topic_id"],
+        )
+        message_id = response.get("result", {}).get("message_id", "-")
+        print(
+            "Custom group message sent: "
+            f"chat_id={destination['group_chat_id']} "
+            f"topic_id={destination['topic_id'] if destination['topic_id'] is not None else '-'} "
+            f"message_id={message_id}"
+        )
         return True
 
     if getattr(args, "cleanup_telegram_updates", False):

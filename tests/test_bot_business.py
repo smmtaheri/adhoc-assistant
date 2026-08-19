@@ -2956,6 +2956,7 @@ role = "frontend"
     def _runtime_cli_args(self, **overrides) -> argparse.Namespace:
         args = argparse.Namespace(
             show_runtime_settings=False,
+            send_group_message=None,
             cleanup_telegram_updates=False,
             older_than_days=90,
             set_telegram_group_chat_id=None,
@@ -3030,6 +3031,43 @@ role = "frontend"
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
+
+    def test_cli_can_send_custom_group_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            configure_runtime(repo, tmp_path)
+            repo.set_telegram_destination(group_chat_id=-100123, topic_id=456)
+
+            with mock.patch(
+                "adhoc_assistant.telegram_bot.service.TelegramClient"
+            ) as client_class:
+                client_class.return_value.send_message.return_value = {
+                    "result": {"message_id": 789}
+                }
+                args = self._runtime_cli_args(send_group_message="سلام تیم")
+
+                self.assertTrue(handle_local_db_command(repo, bot_settings, args))
+
+                client_class.assert_called_once_with("TEST_TOKEN")
+                client_class.return_value.send_message.assert_called_once_with(
+                    chat_id=-100123,
+                    text="سلام تیم",
+                    message_thread_id=456,
+                )
+
+    def test_cli_rejects_empty_custom_group_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bot_settings = settings(tmp_path)
+            repo = BotRepository(bot_settings.database_path)
+            args = self._runtime_cli_args(send_group_message="  ")
+
+            with self.assertRaises(SystemExit) as ctx:
+                handle_local_db_command(repo, bot_settings, args)
+
+            self.assertIn("must not be empty", str(ctx.exception))
 
     def test_cli_can_deactivate_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
