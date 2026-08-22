@@ -14,7 +14,7 @@ from .exporters import (
 )
 from .scheduler import build_schedule
 from .storage import load_history_from_db, save_month_to_db
-from .telegram_bot.repository import BotRepository
+from .telegram_bot.repository import BotRepository, schedule_person_key
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,8 +79,9 @@ def main() -> None:
     config = load_config(Path(args.config))
 
     db_path = Path(args.db)
+    repository = BotRepository(db_path)
+    database_members = repository.list_schedule_members(active_only=True)
     if not config["people"]:
-        members = BotRepository(db_path).list_schedule_members(active_only=True)
         config["people"] = [
             {
                 "name": member.name,
@@ -88,7 +89,7 @@ def main() -> None:
                 "unavailable_dates": [],
                 "unavailable_weekdays": [],
             }
-            for member in members
+            for member in database_members
         ]
         if len(config["people"]) < 2:
             raise SystemExit(
@@ -107,6 +108,27 @@ def main() -> None:
         )
 
     schedule, stats = build_schedule(config, db_history=db_history)
+
+    members_by_name = {member.name: member for member in database_members}
+    color_key_by_name = {}
+    for person in config["people"]:
+        member = members_by_name.get(person["name"])
+        color_key_by_name[person["name"]] = (
+            schedule_person_key(member) if member is not None else person["name"]
+        )
+    color_by_key = repository.ensure_member_colors(list(color_key_by_name.values()))
+    color_by_name = {
+        name: color_by_key.get(person_key)
+        for name, person_key in color_key_by_name.items()
+    }
+    schedule = [
+        {
+            **item,
+            "main_color_index": color_by_name.get(item["main"]),
+            "backup_color_index": color_by_name.get(item["backup"]),
+        }
+        for item in schedule
+    ]
 
     print_terminal_calendar(
         schedule,

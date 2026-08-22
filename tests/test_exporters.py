@@ -7,7 +7,13 @@ from unittest import mock
 
 from PIL import Image, UnidentifiedImageError
 
-from adhoc_assistant.exporters import export_image_calendar, write_svg_as_jpg
+from adhoc_assistant.exporters import (
+    PERSON_BACKGROUND_PALETTE,
+    build_calendar_rows,
+    export_html_calendar,
+    export_image_calendar,
+    write_svg_as_jpg,
+)
 
 
 def sample_schedule() -> list[dict]:
@@ -204,8 +210,65 @@ class ImageExporterTests(unittest.TestCase):
         self.assertIn('class="owner" font-size="', svg)
         self.assertIn('class="helper" font-size="', svg)
         self.assertGreaterEqual(svg.count("<tspan"), 3)
-        self.assertIn("Mohammad Hossein", svg)
+        self.assertIn(">Mohammad</tspan>", svg)
+        self.assertIn(">Hossein…</tspan>", svg)
         self.assertIn("Very Long Helper", svg)
+
+    def test_main_name_wraps_at_fixed_size_and_friday_is_presentation_only(self) -> None:
+        schedule = [
+            {
+                "gregorian_date": "2026-06-23",
+                "date": "1405-04-02",
+                "day": 2,
+                "weekday": "سه‌شنبه",
+                "holiday": "",
+                "main": "Mahdi Farhang",
+                "backup": "Ali",
+                "main_color_index": 7,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svg_path = Path(tmp) / "schedule.svg"
+            html_path = Path(tmp) / "schedule.html"
+            export_image_calendar(schedule, 1405, 4, "jalali", svg_path)
+            export_html_calendar(schedule, 1405, 4, "jalali", html_path)
+            svg = svg_path.read_text(encoding="utf-8")
+            document = html_path.read_text(encoding="utf-8")
+
+        self.assertEqual(len(PERSON_BACKGROUND_PALETTE), 20)
+        self.assertIn('fill="#eef2ff"', svg)
+        self.assertIn('class="owner" font-size="25px"', svg)
+        self.assertIn(">Mahdi</tspan>", svg)
+        self.assertIn(">Farhang</tspan>", svg)
+        name_lines = re.search(
+            r'<text x="(\d+)" y="\d+" class="owner" font-size="25px">'
+            r'<tspan x="(\d+)"[^>]*>Mahdi</tspan>'
+            r'<tspan x="(\d+)"[^>]*>Farhang</tspan>',
+            svg,
+        )
+        self.assertIsNotNone(name_lines)
+        self.assertGreater(int(name_lines.group(3)), int(name_lines.group(2)))
+        self.assertIn(">جمعه</text>", svg)
+        self.assertIn('fill="#eef1f3"', svg)
+        self.assertNotIn("بدون شیفت", svg)
+        self.assertIn("repeat(7, minmax(0, 1fr))", document)
+        self.assertIn("margin-inline-start", document)
+
+    def test_calendar_rows_have_a_gray_placeholder_for_each_friday(self) -> None:
+        rows = build_calendar_rows(
+            sample_schedule(),
+            "jalali",
+            year=1405,
+            month=4,
+            include_friday=True,
+        )
+
+        self.assertTrue(rows)
+        self.assertTrue(all(len(row) == 7 for row in rows))
+        off_days = [item for row in rows for item in row if item and item.get("is_off_day")]
+        self.assertTrue(off_days)
+        self.assertTrue(all(item["main"] == "" and item["backup"] == "" for item in off_days))
 
     def test_jpg_export_rasterizes_calendar_with_white_background(self) -> None:
         if shutil.which("rsvg-convert") is None:

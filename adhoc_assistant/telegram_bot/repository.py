@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from adhoc_assistant.constants import PERSON_COLOR_COUNT
 from adhoc_assistant.scheduler import stats_to_plain_dict
 from adhoc_assistant.storage import init_db as init_schedule_db
 from adhoc_assistant.telegram_bot.settings import Member, RuntimeSettings
@@ -344,6 +345,26 @@ class BotRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS member_color_assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_key TEXT NOT NULL,
+                    color_index INTEGER NOT NULL
+                        CHECK (color_index >= 0 AND color_index < {PERSON_COLOR_COUNT}),
+                    assigned_at TEXT NOT NULL,
+                    released_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_member_color_assignments_current_person
+                ON member_color_assignments(person_key)
+                WHERE released_at IS NULL
                 """
             )
             self.ensure_column(
@@ -2397,6 +2418,11 @@ class BotRepository:
                     now,
                 ),
             )
+            eligible_now = bool(active and participates_in_schedule)
+            if eligible_now:
+                self._ensure_member_color_conn(conn, username)
+            else:
+                self._release_member_color_conn(conn, username)
 
     def get_user_by_username(self, username: str) -> dict | None:
         username = normalize_username(username)
@@ -2462,6 +2488,8 @@ class BotRepository:
                 """,
                 (utc_now(), username),
             )
+            if cursor.rowcount == 1:
+                self._release_member_color_conn(conn, username)
         return cursor.rowcount == 1
 
     def delete_user(self, username: str) -> bool:
@@ -2469,11 +2497,130 @@ class BotRepository:
         if not username:
             raise ValueError("username is required")
         with self.connect() as conn:
+            self._release_member_color_conn(conn, username)
             cursor = conn.execute(
                 "DELETE FROM bot_users WHERE username = ?",
                 (username,),
             )
         return cursor.rowcount == 1
+
+    def _ensure_member_color_conn(self, conn: sqlite3.Connection, person_key: str) -> int:
+        person_key = str(person_key or "").strip()
+        if not person_key:
+            raise ValueError("person_key is required for color assignment")
+
+        current = conn.execute(
+            """
+            SELECT color_index
+            FROM member_color_assignments
+            WHERE person_key = ? AND released_at IS NULL
+            """,
+            (person_key,),
+        ).fetchone()
+        if current is not None:
+            return int(current[0])
+
+        used = {
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT color_index
+                FROM member_color_assignments
+                WHERE released_at IS NULL
+                """
+            ).fetchall()
+        }
+        color_index = next(
+            (
+                index
+                for index in range(PERSON_COLOR_COUNT)
+                if index not in used
+            ),
+            None,
+        )
+        if color_index is None:
+            # All colors are occupied. Reuse colors from the beginning in a
+            # deterministic cycle; duplicates are expected only in this case.
+            last_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM member_color_assignments"
+            ).fetchone()[0]
+            color_index = int(last_id) % PERSON_COLOR_COUNT
+
+        conn.execute(
+            """
+            INSERT INTO member_color_assignments (
+                person_key,
+                color_index,
+                assigned_at,
+                released_at
+            )
+            VALUES (?, ?, ?, NULL)
+            """,
+            (person_key, color_index, utc_now()),
+        )
+        return color_index
+
+    def _release_member_color_conn(self, conn: sqlite3.Connection, person_key: str) -> None:
+        person_key = str(person_key or "").strip()
+        if not person_key:
+            return
+        conn.execute(
+            """
+            UPDATE member_color_assignments
+            SET released_at = ?
+            WHERE person_key = ? AND released_at IS NULL
+            """,
+            (utc_now(), person_key),
+        )
+
+    def ensure_member_colors(self, person_keys: list[str]) -> dict[str, int]:
+        normalized = []
+        seen = set()
+        for person_key in person_keys:
+            key = str(person_key or "").strip()
+            if key and key not in seen:
+                normalized.append(key)
+                seen.add(key)
+
+        if not normalized:
+            return {}
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for person_key in normalized:
+                self._ensure_member_color_conn(conn, person_key)
+            placeholders = ",".join("?" for _ in normalized)
+            rows = conn.execute(
+                f"""
+                SELECT person_key, color_index
+                FROM member_color_assignments
+                WHERE released_at IS NULL
+                  AND person_key IN ({placeholders})
+                """,
+                normalized,
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def member_color_assignments(self, *, current_only: bool = True) -> list[dict]:
+        where = "WHERE released_at IS NULL" if current_only else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT person_key, color_index, assigned_at, released_at
+                FROM member_color_assignments
+                {where}
+                ORDER BY id
+                """
+            ).fetchall()
+        return [
+            {
+                "person_key": row[0],
+                "color_index": int(row[1]),
+                "assigned_at": row[2],
+                "released_at": row[3],
+            }
+            for row in rows
+        ]
 
     def authorize_user_from_start(
         self,

@@ -14,6 +14,33 @@ from adhoc_assistant.telegram_bot.settings import (
 
 
 class BotSettingsTests(unittest.TestCase):
+    def test_member_colors_are_stable_released_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = BotRepository(Path(tmp) / "adhoc.sqlite3")
+            repo.upsert_user(
+                username="first",
+                display_name="First",
+                role="member",
+                access_level="member",
+            )
+            self.assertEqual(repo.ensure_member_colors(["first"]), {"first": 0})
+            self.assertEqual(repo.ensure_member_colors(["first"]), {"first": 0})
+
+            repo.upsert_user(
+                username="second",
+                display_name="Second",
+                role="member",
+                access_level="member",
+            )
+            repo.deactivate_user("first")
+            self.assertEqual(repo.ensure_member_colors(["second", "new"])["new"], 0)
+
+            current = repo.member_color_assignments()
+            self.assertEqual(
+                {item["person_key"] for item in current},
+                {"second", "new"},
+            )
+
     def test_resolve_database_path_prefers_env_over_default(self) -> None:
         with mock.patch.dict(os.environ, {"DATABASE_URL": "sqlite:///from-url.sqlite3"}, clear=False):
             self.assertEqual(resolve_database_path(), Path("from-url.sqlite3"))

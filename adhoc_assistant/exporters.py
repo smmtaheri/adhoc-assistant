@@ -8,7 +8,13 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
-from .calendars import format_month_title
+from .calendars import (
+    display_day,
+    format_date,
+    format_month_title,
+    format_weekday,
+    month_days,
+)
 from .constants import (
     GREGORIAN_CALENDAR_WEEKDAYS,
     JALALI_CALENDAR_WEEKDAYS,
@@ -26,6 +32,32 @@ DAY_PALETTE = [
     "#f4f1ff",
     "#eef8f6",
 ]
+
+PERSON_BACKGROUND_PALETTE = [
+    "#fff8df",
+    "#edf7ff",
+    "#effaf0",
+    "#fff0f1",
+    "#f4f1ff",
+    "#eef8f6",
+    "#fff4e5",
+    "#eef2ff",
+    "#f4f8e8",
+    "#fff1f7",
+    "#eaf8fb",
+    "#f6efe8",
+    "#f0f1ff",
+    "#eef8ed",
+    "#fff0e8",
+    "#eaf6f1",
+    "#f7efff",
+    "#eef5ff",
+    "#f5f7e7",
+    "#fff2ec",
+]
+
+OFF_DAY_BACKGROUND = "#eef1f3"
+OFF_DAY_BORDER = "#c5cbd1"
 
 
 GREGORIAN_MONTH_NAMES_BY_LANGUAGE = {
@@ -176,7 +208,7 @@ IMAGE_TEXTS = {
         "main": "Bug Day",
         "backup": "Helper",
         "total": "Total",
-        "subtitle": "Team calendar from Saturday through Thursday.",
+        "subtitle": "Team calendar from Saturday through Friday.",
     },
     "fa": {
         "title": "برنامه ادهاک {month}",
@@ -184,7 +216,7 @@ IMAGE_TEXTS = {
         "main": "روز باگ",
         "backup": "پشتیبان",
         "total": "کل",
-        "subtitle": "تقویم تیم از شنبه تا پنجشنبه.",
+        "subtitle": "تقویم تیم از شنبه تا جمعه.",
     },
     "ar": {
         "title": "جدول Adhoc - {month}",
@@ -192,7 +224,7 @@ IMAGE_TEXTS = {
         "main": "المسؤول الأساسي",
         "backup": "الاحتياطي",
         "total": "المجموع",
-        "subtitle": "تقويم الفريق من السبت إلى الخميس.",
+        "subtitle": "تقويم الفريق من السبت إلى الجمعة.",
     },
     "ru": {
         "title": "График Adhoc - {month}",
@@ -200,7 +232,7 @@ IMAGE_TEXTS = {
         "main": "Основной",
         "backup": "Резерв",
         "total": "Всего",
-        "subtitle": "Календарь команды с субботы по четверг.",
+        "subtitle": "Календарь команды с субботы по пятницу.",
     },
 }
 
@@ -254,10 +286,16 @@ def calendar_weekday_names(
     return WEEKDAY_NAMES_BY_LANGUAGE[lang]
 
 
-def visual_weekdays(calendar_type: str) -> list[int]:
+def visual_weekdays(
+    calendar_type: str,
+    *,
+    include_friday: bool = False,
+) -> list[int]:
     if calendar_type == "jalali":
-        return JALALI_CALENDAR_WEEKDAYS
-    return GREGORIAN_CALENDAR_WEEKDAYS
+        weekdays = list(JALALI_CALENDAR_WEEKDAYS)
+        return [4, *weekdays] if include_friday else weekdays
+    weekdays = list(GREGORIAN_CALENDAR_WEEKDAYS)
+    return [*weekdays, 4] if include_friday else weekdays
 
 
 def internal_date(item: dict) -> date:
@@ -353,11 +391,45 @@ def default_image_output_path(year: int, month: int) -> Path:
 def build_calendar_rows(
     schedule: list[dict],
     calendar_type: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+    include_friday: bool = False,
 ) -> list[list[dict | None]]:
-    weekdays = visual_weekdays(calendar_type)
+    weekdays = visual_weekdays(calendar_type, include_friday=include_friday)
     weekday_columns = {weekday: index for index, weekday in enumerate(weekdays)}
     rows = []
     current_row = [None] * len(weekdays)
+
+    if include_friday:
+        if year is None or month is None:
+            raise ValueError("year and month are required when rendering Friday")
+
+        schedule_by_date = {internal_date(item): item for item in schedule}
+        days = month_days(year, month, calendar_type)
+        for current_day in days:
+            if current_day.weekday() == 5 and any(current_row):
+                rows.append(current_row)
+                current_row = [None] * len(weekdays)
+
+            item = schedule_by_date.get(current_day)
+            if current_day.weekday() == 4:
+                item = {
+                    "gregorian_date": current_day.isoformat(),
+                    "date": format_date(current_day, calendar_type),
+                    "day": display_day(current_day, calendar_type),
+                    "weekday": format_weekday(current_day, calendar_type),
+                    "holiday": "",
+                    "main": "",
+                    "backup": "",
+                    "is_off_day": True,
+                }
+            if item is not None:
+                current_row[weekday_columns[current_day.weekday()]] = item
+
+        if any(current_row):
+            rows.append(current_row)
+        return rows
 
     for item in schedule:
         current_day = internal_date(item)
@@ -374,20 +446,46 @@ def build_calendar_rows(
     return rows
 
 
-def render_calendar_card(item: dict | None) -> str:
+def render_calendar_card(
+    item: dict | None,
+) -> str:
     if item is None:
         return '<div class="day-card day-card--empty"></div>'
 
     current_day = internal_date(item)
-    color_index = current_day.day % len(DAY_PALETTE)
     day_number = html.escape(str(item.get("day", current_day.day)))
-    main = html.escape(item["main"])
+    if item.get("is_off_day"):
+        return f"""
+        <article class="day-card day-card--off" style="--card-bg: {OFF_DAY_BACKGROUND}">
+            <div class="day-card__top">
+                <span class="day-number day-number--off">{day_number}</span>
+            </div>
+        </article>
+    """
+
+    color_index = item.get("main_color_index")
+    if not isinstance(color_index, int) or not 0 <= color_index < len(PERSON_BACKGROUND_PALETTE):
+        color_index = current_day.day % len(DAY_PALETTE)
+        background = DAY_PALETTE[color_index]
+    else:
+        background = PERSON_BACKGROUND_PALETTE[color_index]
+    main_lines = svg_text_lines(item["main"], max_chars=11, max_lines=2)
+    main_markup = []
+    for index, line in enumerate(main_lines):
+        indent = ""
+        if index == 1:
+            indent_em = min(len(main_lines[0]) * 0.28, 3.2)
+            indent = f' style="margin-inline-start: {indent_em:.2f}em"'
+        main_markup.append(
+            f'<span class="bug-day-name__line"{indent}>{html.escape(line)}</span>'
+        )
+    main = "".join(main_markup)
     backup = html.escape(item["backup"])
     holiday = html.escape(item.get("holiday", ""))
     holiday_badge = f'<div class="holiday-badge">{holiday}</div>' if holiday else ""
 
     return f"""
-        <article class="day-card" style="--card-bg: {DAY_PALETTE[color_index]}">
+        <article class="day-card" style="--card-bg: {background}">
             <div class="day-card__top">
                 <span class="day-number">{day_number}</span>
                 {holiday_badge}
@@ -411,8 +509,14 @@ def export_html_calendar(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lang = export_language(language, calendar_type)
     direction = text_direction(lang)
-    weekdays = visual_weekdays(calendar_type)
-    rows = build_calendar_rows(schedule, calendar_type)
+    weekdays = visual_weekdays(calendar_type, include_friday=True)
+    rows = build_calendar_rows(
+        schedule,
+        calendar_type,
+        year=year,
+        month=month,
+        include_friday=True,
+    )
     weekday_names = calendar_weekday_names(calendar_type, lang)
     weekday_headers = "\n".join(
         f"<div class=\"weekday-heading\">{html.escape(weekday_names[index])}</div>"
@@ -461,7 +565,7 @@ def export_html_calendar(
         }}
 
         .page {{
-            width: min(1180px, calc(100% - 32px));
+            width: min(1380px, calc(100% - 32px));
             margin: 0 auto;
             padding: 32px 0 40px;
         }}
@@ -497,7 +601,7 @@ def export_html_calendar(
         .weekday-row,
         .calendar-row {{
             display: grid;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            grid-template-columns: repeat(7, minmax(0, 1fr));
             gap: 10px;
         }}
 
@@ -541,6 +645,17 @@ def export_html_calendar(
             box-shadow: none;
         }}
 
+        .day-card--off {{
+            color: #59636d;
+            border-color: {OFF_DAY_BORDER};
+            box-shadow: none;
+        }}
+
+        .day-number--off {{
+            background: #dfe4e8;
+            color: #59636d;
+        }}
+
         .day-card__top {{
             display: flex;
             align-items: center;
@@ -578,6 +693,10 @@ def export_html_calendar(
             font-size: 1.18rem;
             font-weight: 850;
             overflow-wrap: anywhere;
+        }}
+
+        .bug-day-name__line {{
+            min-width: 0;
         }}
 
         .helper-pill {{
@@ -694,28 +813,69 @@ def svg_tspans(
     *,
     x: int,
     line_height: int,
+    x_values: list[int] | None = None,
 ) -> str:
     return "".join(
-        f'<tspan x="{x}" dy="{0 if index == 0 else line_height}">{html.escape(line)}</tspan>'
+        f'<tspan x="{(x_values[index] if x_values else x)}" '
+        f'dy="{0 if index == 0 else line_height}">{html.escape(line)}</tspan>'
         for index, line in enumerate(lines)
     )
 
 
-def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -> str:
+def svg_name_line_x_values(
+    lines: list[str],
+    *,
+    left: int,
+    right: int,
+    font_size: int,
+) -> list[int]:
+    if len(lines) <= 1:
+        return [left]
+
+    # Keep the second line visually indented under the first line while
+    # guaranteeing that its estimated right edge stays inside the card.
+    average_char_width = font_size * 0.56
+    first_width = len(lines[0]) * average_char_width
+    second_width = len(lines[1]) * average_char_width
+    preferred = left + int(first_width * 0.5)
+    latest_safe_start = right - int(second_width)
+    return [left, max(left, min(preferred, latest_safe_start))]
+
+
+def render_svg_day(
+    item: dict | None,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> str:
     if item is None:
         return ""
 
     current_day = internal_date(item)
-    bg = DAY_PALETTE[current_day.day % len(DAY_PALETTE)]
     day_number = html.escape(str(item.get("day", current_day.day)))
-    main_lines = svg_text_lines(item["main"], max_chars=18, max_lines=3)
+    if item.get("is_off_day"):
+        return f"""
+    <g>
+        <rect x="{x}" y="{y}" width="{width}" height="{height}" rx="8"
+              fill="{OFF_DAY_BACKGROUND}" stroke="{OFF_DAY_BORDER}" stroke-width="1"/>
+        <circle cx="{x + 26}" cy="{y + 26}" r="16" fill="#dfe4e8"/>
+        <text x="{x + 26}" y="{y + 31}" text-anchor="middle" class="day-number day-number--off">{day_number}</text>
+        <line x1="{x + 12}" y1="{y + 52}" x2="{x + width - 12}" y2="{y + 52}"
+              stroke="#d2d7dc"/>
+    </g>
+    """
+
+    color_index = item.get("main_color_index")
+    if not isinstance(color_index, int) or not 0 <= color_index < len(PERSON_BACKGROUND_PALETTE):
+        color_index = current_day.day % len(DAY_PALETTE)
+        bg = DAY_PALETTE[color_index]
+    else:
+        bg = PERSON_BACKGROUND_PALETTE[color_index]
+
+    main_lines = svg_text_lines(item["main"], max_chars=11, max_lines=2)
     backup_lines = svg_text_lines(item["backup"], max_chars=23, max_lines=2)
-    main_size = svg_font_size_for_lines(
-        main_lines,
-        base_size=25,
-        min_size=15,
-        comfortable_chars=12,
-    )
+    main_size = 25
     backup_size = svg_font_size_for_lines(
         backup_lines,
         base_size=13,
@@ -724,11 +884,24 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
     )
     main_line_height = max(17, main_size + 4)
     backup_line_height = max(11, backup_size + 3)
-    main_y = y + 84 if len(main_lines) > 2 else y + 92
+    main_y = y + 76 if len(main_lines) > 1 else y + 92
     helper_box_height = 31 if len(backup_lines) == 1 else 44
     helper_box_y = y + height - helper_box_height - 10
     helper_text_y = helper_box_y + 19 if len(backup_lines) == 1 else helper_box_y + 16
-    main_markup = svg_tspans(main_lines, x=x + 18, line_height=main_line_height)
+    main_left = x + 18
+    main_right = x + width - 18
+    main_x_values = svg_name_line_x_values(
+        main_lines,
+        left=main_left,
+        right=main_right,
+        font_size=main_size,
+    )
+    main_markup = svg_tspans(
+        main_lines,
+        x=main_left,
+        x_values=main_x_values,
+        line_height=main_line_height,
+    )
     backup_markup = svg_tspans(
         backup_lines,
         x=x + width - 26,
@@ -751,7 +924,7 @@ def render_svg_day(item: dict | None, x: int, y: int, width: int, height: int) -
         {holiday_text}
         <line x1="{x + 12}" y1="{y + 52}" x2="{x + width - 12}" y2="{y + 52}"
               stroke="#deded8"/>
-        <text x="{x + 18}" y="{main_y}" class="owner" font-size="{main_size}px">{main_markup}</text>
+        <text x="{main_left}" y="{main_y}" class="owner" font-size="{main_size}px">{main_markup}</text>
         <rect x="{x + 14}" y="{helper_box_y}" width="{width - 28}" height="{helper_box_height}"
               rx="13.5" fill="#ffffff" fill-opacity="0.78" stroke="#dddddd"/>
         <text x="{x + width - 26}" y="{helper_text_y}" text-anchor="end"
@@ -926,8 +1099,14 @@ def build_calendar_svg(
 ) -> str:
     lang = export_language(language, calendar_type)
     direction = text_direction(lang)
-    weekdays = visual_weekdays(calendar_type)
-    rows = build_calendar_rows(schedule, calendar_type)
+    weekdays = visual_weekdays(calendar_type, include_friday=True)
+    rows = build_calendar_rows(
+        schedule,
+        calendar_type,
+        year=year,
+        month=month,
+        include_friday=True,
+    )
     weekday_names = calendar_weekday_names(calendar_type, lang)
     cell_width = 198
     cell_height = 174
@@ -967,7 +1146,15 @@ def build_calendar_svg(
         y = top + row_index * (cell_height + gap)
         for column_index, item in enumerate(row):
             x = left + column_index * (cell_width + gap)
-            cards.append(render_svg_day(item, x, y, cell_width, cell_height))
+            cards.append(
+                render_svg_day(
+                    item,
+                    x,
+                    y,
+                    cell_width,
+                    cell_height,
+                )
+            )
 
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"
      viewBox="0 0 {width} {height}" style="background:#ffffff">
@@ -975,6 +1162,7 @@ def build_calendar_svg(
         .title {{ font: 900 38px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #202124; }}
         .weekday {{ font: 850 17px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #55585f; }}
         .day-number {{ font: 900 17px "Noto Sans", sans-serif; fill: #19766d; }}
+        .day-number--off {{ fill: #59636d; }}
         .holiday {{ font: 800 13px "Noto Sans Arabic", "Iranian Sans", "Noto Sans", sans-serif; fill: #7a4e00; }}
         .owner {{ font-family: "Noto Sans", sans-serif; font-weight: 900; fill: #202124; }}
         .helper {{ font-family: "Noto Sans", sans-serif; font-weight: 800; fill: #4f5358; }}

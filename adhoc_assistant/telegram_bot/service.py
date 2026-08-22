@@ -1578,6 +1578,7 @@ def relabel_schedule_outputs(
         schedule_person_key(member): display_label_for_member(repo, member)
         for member in schedule_members(members)
     }
+    color_by_key = repo.ensure_member_colors(list(label_by_key))
 
     def relabel_name(name: str) -> str:
         return label_by_key.get(name, name)
@@ -1585,6 +1586,8 @@ def relabel_schedule_outputs(
     relabeled_schedule = [
         {
             **item,
+            "main_color_index": color_by_key.get(item["main"]),
+            "backup_color_index": color_by_key.get(item["backup"]),
             "main": relabel_name(item["main"]),
             "backup": relabel_name(item["backup"]),
         }
